@@ -37,6 +37,9 @@ const (
 	xdelta3MagicNumber uint32 = 0x00c4c3d6
 	snapDeltaFormat           = "snapDeltaV1"
 	xdelta3Format             = "xdelta3"
+	detlaToolXdelta3   uint16 = 0x1
+	detlaToolBsdiff    uint16 = 0x2
+	defaultDeltaTool   uint16 = detlaToolXdelta3
 )
 
 var (
@@ -54,7 +57,7 @@ var (
 const (
 	flagCheck             uint16 = 0x0004
 	flagNoFragments       uint16 = 0x0010
-	flagNoDuplicates      uint16 = 0x0040 // Note: logic is inverted (default is duplicates)
+	flagDuplicates        uint16 = 0x0040 // Note: logic is inverted (default is duplicates)
 	flagExports           uint16 = 0x0080
 	flagNoXattrs          uint16 = 0x0200
 	flagCompressorOptions uint16 = 0x0400
@@ -67,6 +70,8 @@ var (
 	mksquashfs  = filepath.Join(toolboxSnap, "/usr/bin/mksquashfs")
 	unsquashfs  = filepath.Join(toolboxSnap, "/usr/bin/unsquashfs")
 	xdelta3     = filepath.Join(snapdSnap, "/usr/bin/xdelta3")
+	bsdiff      = filepath.Join(snapdSnap, "/usr/bin/bsdiff")
+	bspatch     = filepath.Join(snapdSnap, "/usr/bin/bspatch")
 )
 
 // --- Main Execution ---
@@ -78,6 +83,7 @@ func main() {
 
 	// Setup subcommands
 	var genSource, genTarget, genDelta, appSource, appTarget, appDelta string
+	var xdelta3Tool, bsdiffTool bool
 	generateCmd := flag.NewFlagSet("generate", flag.ExitOnError)
 	generateCmd.StringVar(&genSource, "source", "", "source snap file (required)")
 	generateCmd.StringVar(&genSource, "s", "", "source snap file (required)")
@@ -85,6 +91,8 @@ func main() {
 	generateCmd.StringVar(&genTarget, "t", "", "target snap file (required)")
 	generateCmd.StringVar(&genDelta, "delta", "", "delta output file (required)")
 	generateCmd.StringVar(&genDelta, "d", "", "delta output file (required)")
+	generateCmd.BoolVar(&xdelta3Tool, "xdelta3", false, "used complression tool")
+	generateCmd.BoolVar(&bsdiffTool, "bsdiff", false, "used complression tool")
 
 	applyCmd := flag.NewFlagSet("apply", flag.ExitOnError)
 	applyCmd.StringVar(&appSource, "source", "", "source snap file (required)")
@@ -111,7 +119,12 @@ func main() {
 			generateCmd.Usage()
 			log.Fatal("Missing required parameters for 'generate'")
 		}
-		err = handleGenerateDelta(genSource, genTarget, genDelta)
+		// default to xdelta3 if bsdiffTool is not defined
+		deltaTool := defaultDeltaTool
+		if bsdiffTool {
+			deltaTool = detlaToolBsdiff
+		}
+		err = handleGenerateDelta(genSource, genTarget, genDelta, deltaTool)
 
 	case "apply":
 		applyCmd.Parse(os.Args[2:])
@@ -147,14 +160,21 @@ func printUsageAndExit(msg ...string) {
 	fmt.Fprintln(os.Stderr, "\tgenerate: generate delta between source and target")
 	fmt.Fprintln(os.Stderr, "\tapply:    apply delta on the source")
 	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, "Arguments:")
+	fmt.Fprintln(os.Stderr, "Compulsory arguments:")
 	fmt.Fprintln(os.Stderr, "\t--source | -s: source snap")
 	fmt.Fprintln(os.Stderr, "\t--target | -t: target snap")
 	fmt.Fprintln(os.Stderr, "\t--delta  | -d: delta between source and target snap")
 	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Optional arguments:")
+	fmt.Fprintln(os.Stderr, "\t--bsdiff:   use bsdiff(bfpatch) as delta tool to generate and apply delta on squashfs pseudo file definition")
+	fmt.Fprintln(os.Stderr, "\t            this delta tool does not support streams, full sized temp source and target pseudo files will be created!")
+	fmt.Fprintln(os.Stderr, "\t            !! only available during delta generation !!")
+	fmt.Fprintln(os.Stderr, "\t--xdelta3:  use xdelta3 as delta tool to generate and apply delta on squashfs pseudo file definition")
+	fmt.Fprintln(os.Stderr, "\t            !! only available during delta generation !!")
+	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintf(os.Stderr, "\t%s generate --source <source snap file> --target <output file> --delta <delta file>\n", appName)
-	fmt.Fprintf(os.Stderr, "\t%s apply    --source <source snap file> --target <output file> --delta <delta file>\n", appName)
+	fmt.Fprintf(os.Stderr, "\t%s generate --bsdiff --source <SNAP>  --target <SNAP> --delta <DELTA>\n", appName)
+	fmt.Fprintf(os.Stderr, "\t%s apply    --source <SNAP>  --target <SNAP> --delta <DELTA>\n", appName)
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Example:")
 	fmt.Fprintf(os.Stderr, "\t%s generate --source core22_2134.snap --target core22_2140.snap --delta delta-core22-2134-2140.delta\n", appName)
@@ -170,8 +190,8 @@ func SupportedDeltaFormats() string {
 type SquashfsCommand func(args ...string) *exec.Cmd
 
 // Check if all the required tools are actually present
-// returns ready to use commands for xdelta3, mksquashfs and unsquashfs
-func CheckSupportedDetlaFormats(ctx context.Context) (string, SquashfsCommand, SquashfsCommand, SquashfsCommand, error) {
+// returns ready to use commands for xdelta3, bsdiff, mksquashfs and unsquashfs
+func CheckSupportedDetlaFormats(ctx context.Context) (string, SquashfsCommand, SquashfsCommand, SquashfsCommand, SquashfsCommand, error) {
 	// check if we have required tools available
 	xdeltaCmd, err := checkForTooling(ctx, xdelta3, "xdelta3", "config")
 	if err != nil {
@@ -187,6 +207,11 @@ func CheckSupportedDetlaFormats(ctx context.Context) (string, SquashfsCommand, S
 	if err != nil {
 		return xdelta3Format, xdeltaCmd, nil, nil, fmt.Errorf("missing snapd delta dependencies: %v", err)
 	}
+	bsdiffCmd, err := checkForTooling(ctx, bsdiff, "bsdiff", "config")
+	if err != nil {
+		return "", nil, nil, nil, fmt.Errorf("missing snapd delta dependencies: %v", err)
+	}
+
 	return snapDeltaFormat + ";" + xdelta3Format, xdeltaCmd, mksquashfsCmd, unsquashfsCmd, nil
 }
 
@@ -253,9 +278,8 @@ func parseSuperblockFlags(flags uint16, mksqfsArgs []string) ([]string, error) {
 	if (flags & flagNoFragments) != 0 {
 		mksqfsArgs = append(mksqfsArgs, "-no-fragments")
 	}
-	// Note: The flag is "NO_DUPLICATES", so if it's *not* set, we... wait.
-	// The bash script logic is: if 0x0040 is *not* set, add -no-duplicates.
-	if (flags & flagNoDuplicates) == 0 {
+	// Note: The flag is "DUPLICATES", so if it's *not* set add -no-duplicates.
+	if (flags & flagDuplicates) == 0 {
 		mksqfsArgs = append(mksqfsArgs, "-no-duplicates")
 	}
 	if (flags & flagExports) != 0 {
@@ -336,7 +360,7 @@ func runService(ctx context.Context, cmd *exec.Cmd) error {
 }
 
 // generate delta file.
-func handleGenerateDelta(sourceSnap, targetSnap, delta string) error {
+func handleGenerateDelta(sourceSnap, targetSnap, delta string, deltaTool uint16) error {
 	fmt.Println("Generating delta...")
 
 	// Open target snap to read superblock
@@ -371,6 +395,11 @@ func handleGenerateDelta(sourceSnap, targetSnap, delta string) error {
 		return fmt.Errorf("failed to write snap-delta version: %w", err)
 	}
 
+	// Delta tool used (16b)
+	if err := binary.Write(headerBuf, binary.LittleEndian, uint16(deltaTool)); err != nil {
+		return fmt.Errorf("failed to write snap-delta tool info: %w", err)
+	}
+
 	// Read/Write Timestamp (32b at offset 8)
 	tsBuf := make([]byte, 4)
 	if _, err := targetFile.ReadAt(tsBuf, 8); err != nil {
@@ -403,7 +432,10 @@ func handleGenerateDelta(sourceSnap, targetSnap, delta string) error {
 	if _, err := deltaFile.Write(headerBuf.Bytes()); err != nil {
 		return fmt.Errorf("failed to write header to delta file: %w", err)
 	}
+	return generateXdelta3Delta(deltaFile, sourceSnap, targetSnap, delta)
+}
 
+func generateXdelta3Delta(deltaFile *os.File, sourceSnap, targetSnap, delta string) error {
 	// 1. Setup pipes
 	tempDir, pipePaths, err := setupPipes("source-pipe", "target-pipe")
 	if err != nil {
@@ -430,13 +462,13 @@ func handleGenerateDelta(sourceSnap, targetSnap, delta string) error {
 
 	// unsquashfs source -> source-pipe
 	unsquashfsSourceArgs := []string{
-		"-n", "-pf", sourcePipe, sourceSnap,
+		"-pf", sourcePipe, sourceSnap,
 	}
 	unsquashSourceCmd := unsquashfsCmd(unsquashfsSourceArgs...)
 
 	// unsquashfs target -> target-pipe
 	unsquashfsTargetArgs := []string{
-		"-n", "-pf", targetPipe, targetSnap,
+		"-pf", targetPipe, targetSnap,
 	}
 	unsquashfsTargetCmd := unsquashfsCmd(unsquashfsTargetArgs...)
 
@@ -502,6 +534,32 @@ func handleGenerateDelta(sourceSnap, targetSnap, delta string) error {
 	return nil
 }
 
+func generatebsdiffDelta(deltaFile *os.File, sourceSnap, targetSnap, delta string) error {
+	// 1. create pseudo files
+	tempDir, pseudoFilePaths, err := setupPipes("source", "target")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tempDir)
+	sourcePf := pseudoFilePaths[0]
+	targetPf := pseudoFilePaths[1]
+
+	// 2. unsquash source and target
+	// unsquashfs source -> pseudo file
+	unsquashfsSourceArgs := []string{
+		"-n", "-pf", sourcePf, sourceSnap,
+	}
+	unsquashSourceCmd := unsquashfsCmd(unsquashfsSourceArgs...)
+	unsquashSourceCmd.run()
+
+	// unsquashfs target -> pseudo file
+	unsquashfsTargetArgs := []string{
+		"-n", "-pf", targetPf, targetSnap,
+	}
+	unsquashfsTargetCmd := unsquashfsCmd(unsquashfsTargetArgs...)
+
+}
+
 // --- Apply Delta ---
 func handleApplyDelta(sourceSnap, delta, targetSnap string) error {
 	fmt.Println("Applying delta...")
@@ -541,6 +599,13 @@ func handleApplyDelta(sourceSnap, delta, targetSnap string) error {
 	binary.Read(headerReader, binary.LittleEndian, &versionNumber)
 	if versionNumber != deltaFormatVersion {
 		return fmt.Errorf("mismatch delta version number! (Expected 0x%X, Got 0x%X)", deltaFormatVersion, versionNumber)
+	}
+
+	// delta tool used (16b)
+	var deltaTool uint16
+	binary.Read(headerReader, binary.LittleEndian, &deltaTool)
+	if (deltaTool != detlaToolXdelta3) && (deltaTool != detlaToolBsdiff) {
+		return fmt.Errorf("unrecognised delta tool! (Expected 0x%X or 0x%X but got 0x%X)", detlaToolXdelta3, detlaToolBsdiff, deltaTool)
 	}
 
 	var fstimeint uint32
