@@ -275,10 +275,10 @@ handle_apply_delta() {
     dd if="${DELTA}" of="${delta}" status=none bs="${DELTA_HEADER_SIZE}" skip=1
     if (( DELTA_TOOL_BSDIFF == used_delta_tool )); then
       "${BSPATCH}" "${source_snap_pf}" "${target_pf}" "${delta}"
+      "${MKSQUASHFS}" - "${TARGET_SNAP}" -pf "${target_pf}" -quiet -noappend -comp "${target_compression}" -mkfs-time "${fstimeint}" $(parse_superblock_flags "${target_flags}")
     elif (( DELTA_TOOL_HDIFFPATCH == used_delta_tool )); then
-      "${HPATCHZ}" -f -s-8m "${source_snap_pf}" "${delta}"  "${target_pf}"
+      "${HPATCHZ}" -f -s-8m "${source_snap_pf}" "${delta}" /dev/stdout | "${MKSQUASHFS}" - "${TARGET_SNAP}" -pf - -quiet -noappend -comp "${target_compression}" -mkfs-time "${fstimeint}" $(parse_superblock_flags "${target_flags}")
     fi
-    "${MKSQUASHFS}" - "${TARGET_SNAP}" -pf "${target_pf}" -quiet -noappend -comp "${target_compression}" -mkfs-time "${fstimeint}" $(parse_superblock_flags "${target_flags}")
     rm -rf "${target_pf}" "${raw_delta}"
   else
     echo -e "Unsupported delta tool passed: ${used_delta_tool}"
