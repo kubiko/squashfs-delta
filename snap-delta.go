@@ -258,15 +258,15 @@ func printUsageAndExit(msg ...string) {
 	fmt.Fprintln(os.Stderr, "\t--delta  | -d: delta between source and target snap")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Optional arguments:")
-	fmt.Fprintln(os.Stderr, "\t--bsdiff:   use bsdiff(bfpatch) as delta tool to generate and apply delta on squashfs pseudo file definition")
-	fmt.Fprintln(os.Stderr, "\t            this delta tool does not support streams, full sized temp source and target pseudo files will be created!")
+	fmt.Fprintln(os.Stderr, "\t--hdiff`:   use hdiffz(hpatchz) as delta tool to generate and apply delta on squashfs pseudo file definition")
+	fmt.Fprintln(os.Stderr, "\t            As this delta tool does not support streaming, pseudo file definition is processed per file within the stream.")
 	fmt.Fprintln(os.Stderr, "\t            !! only available during delta generation !!")
 	fmt.Fprintln(os.Stderr, "\t--xdelta3:  use xdelta3 as delta tool to generate and apply delta on squashfs pseudo file definition")
 	fmt.Fprintln(os.Stderr, "\t            !! only available during delta generation !!")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintf(os.Stderr, "\t%s generate --bsdiff --source <SNAP>  --target <SNAP> --delta <DELTA>\n", appName)
-	fmt.Fprintf(os.Stderr, "\t%s apply    --source <SNAP>  --target <SNAP> --delta <DELTA>\n", appName)
+	fmt.Fprintf(os.Stderr, "\t%s generate --hdiffz --source <SNAP>  --target <SNAP> --delta <DELTA>\n", appName)
+	fmt.Fprintf(os.Stderr, "\t%s apply             --source <SNAP>  --target <Snew NAP> --delta <DELTA>\n", appName)
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Example:")
 	fmt.Fprintf(os.Stderr, "\t%s generate --source core22_2134.snap --target core22_2140.snap --delta delta-core22-2134-2140.delta\n", appName)
@@ -1194,7 +1194,7 @@ func setupPipes(pipeNames ...string) (string, []string, error) {
 }
 
 // Check if all the required tools are actually present
-// returns ready to use commands for xdelta3, bsdiff, mksquashfs and unsquashfs
+// returns ready to use commands for xdelta3, hdiffz, hpatchz, mksquashfs and unsquashfs
 func CheckSupportedDetlaFormats(ctx context.Context) (string, DeltaToolingCmd, DeltaToolingCmd, DeltaToolingCmd, DeltaToolingCmd, DeltaToolingCmd, error) {
 	// check if we have required tools available
 	xdeltaCmd, err := checkForTooling(ctx, xdelta3, "xdelta3", "config")
