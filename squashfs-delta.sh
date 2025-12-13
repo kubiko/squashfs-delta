@@ -5,8 +5,8 @@ DELTA_FORMAT_VERSION=0x101
 DELTA_MAGIC_NUMBER=0xF989789C
 XDELTA3_MAGIC_NUMBER=0x00c4c3d6
 DELTA_TOOL_XDELTA3="0x1"
-DELTA_TOOL_BSDIFF="0x2"
-DELTA_TOOL_HDIFFPATCH="0x3"
+DELTA_TOOL_BSDIFF="0x12"     // different strategy to go implementation, diffing entire pf
+DELTA_TOOL_HDIFFPATCH="0x13" // different strategy to go implementation, diffing entire pf
 DEFAULT_DELTA_TOOL="${DELTA_TOOL_XDELTA3}"
 
 ##
