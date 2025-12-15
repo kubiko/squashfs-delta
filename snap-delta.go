@@ -414,28 +414,20 @@ func generateXdelta3Delta(ctx context.Context, deltaFile *os.File, sourceSnap, t
 	// unsquashfs target -> trgt-pipe
 	unsquashTargetArg := append(unsquashfsTuningGenerate, "-pf", targetPipe, targetSnap)
 	unsquashTargetCmd := unsquashfsCmdFn(gctx, unsquashTargetArg...)
+	unsquashTargetCmd.Stdout = os.Stdout
 	// xdelta3 src-pipe, trgt-pipe -> delta-file
 	// Note: We use the tuning args and append specific inputs
 	xdelta3Args := append(xdelta3Tuning, "-e", "-f", "-A", "-s", sourcePipe, targetPipe)
 	xdelta3Cmd := xdelta3ToolCmdFn(gctx, xdelta3Args...)
 	xdelta3Cmd.Stdout = deltaFile
 
-	// 5. Run Concurrent Processes
-
+	// run all prepared services
 	// Run unsquashfs (Source)
-	g.Go(func() error {
-		return wrapErr(runService(unsquashSourceCmd, true), "unsquashfs (source)")
-	})
-
+	g.Go(func() error { return wrapErr(runService(unsquashSourceCmd), "unsquashfs (source)") })
 	// Run unsquashfs (Target)
-	g.Go(func() error {
-		return wrapErr(runService(unsquashTargetCmd, true), "unsquashfs (target)")
-	})
-
+	g.Go(func() error { return wrapErr(runService(unsquashTargetCmd), "unsquashfs (target)") })
 	// Run xdelta3
-	g.Go(func() error {
-		return wrapErr(runService(xdelta3Cmd, false), "xdelta3")
-	})
+	g.Go(func() error { return wrapErr(runService(xdelta3Cmd), "xdelta3") })
 
 	// wait: first error cancels all others
 	return g.Wait()
@@ -477,6 +469,7 @@ func applyXdelta3Delta(ctx context.Context, sourceSnap, targetSnap string, delta
 	}, mksqfsArgs...)
 	sqfsArgs = append(sqfsArgs, mksquashfsTuningApply...)
 	targetCmd := mksquashfsCmdFn(gctx, sqfsArgs...)
+	targetCmd.Stdout = os.Stdout
 
 	// connect xdelta → mksquashfs
 	targetCmd.Stdin, err = xdelta.StdoutPipe()
@@ -485,13 +478,13 @@ func applyXdelta3Delta(ctx context.Context, sourceSnap, targetSnap string, delta
 	}
 
 	// unsquash source → src-pipe
-	g.Go(func() error { return wrapErr(runService(unsq, false), "unsquashfs") })
+	g.Go(func() error { return wrapErr(runService(unsq), "unsquashfs") })
 
 	// xdelta3 filters (src-pipe, delta-pipe) → output
-	g.Go(func() error { return wrapErr(runService(xdelta, false), "xdelta3") })
+	g.Go(func() error { return wrapErr(runService(xdelta), "xdelta3") })
 
 	// mksquashfs builds final snap
-	g.Go(func() error { return wrapErr(runService(targetCmd, true), "mksquashfs") })
+	g.Go(func() error { return wrapErr(runService(targetCmd), "mksquashfs") })
 
 	// delta-body writer ("dd")
 	g.Go(func() error {
@@ -546,9 +539,9 @@ func generateHdiffzDelta(ctx context.Context, deltaFile *os.File, sourceSnap, ta
 	unsquashTargetCmd := unsquashfsCmdFn(gctx, unsquashTargetArg...)
 
 	// unsquash source
-	g.Go(func() error { return wrapErr(runService(unsquashSourceCmd, false), "unsqfs-src") })
+	g.Go(func() error { return wrapErr(runService(unsquashSourceCmd), "unsqfs-src") })
 	// unsquash target
-	g.Go(func() error { return wrapErr(runService(unsquashTargetCmd, true), "unsqfs-trg") })
+	g.Go(func() error { return wrapErr(runService(unsquashTargetCmd), "unsqfs-trg") })
 
 	sp, err := os.Open(sourcePipe)
 	if err != nil {
@@ -770,7 +763,7 @@ func applyHdiffzDelta(ctx context.Context, sourceSnap, targetSnap string, deltaF
 		return fmt.Errorf("failed to create source pipe: %w", err)
 	}
 	// unsquash source
-	g.Go(func() error { return wrapErr(runService(sourceCmd, false), "unsquashfs") })
+	g.Go(func() error { return wrapErr(runService(sourceCmd), "unsquashfs") })
 
 	// Wrap source in a buffered reader for efficient seeking/skipping
 	sourceReader := bufio.NewReaderSize(sourcePipe, CopyBufferSize)
@@ -785,18 +778,15 @@ func applyHdiffzDelta(ctx context.Context, sourceSnap, targetSnap string, deltaF
 	}, mksqfsArgs...)
 	sqfsArgs = append(sqfsArgs, mksquashfsTuningApply...)
 	targetCmd := mksquashfsCmdFn(gctx, sqfsArgs...)
+	targetCmd.Stdout = os.Stdout
 
 	targetStdin, err := targetCmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create target stdin pipe: %w", err)
 	}
 
-	// Capture stderr to debug mksquashfs failures
-	var targetStderr bytes.Buffer
-	targetCmd.Stderr = &targetStderr
-
 	// mksquash target
-	g.Go(func() error { return wrapErr(runService(targetCmd, true), "mksquashfs") })
+	g.Go(func() error { return wrapErr(runService(targetCmd), "mksquashfs") })
 
 	// Parse Source Header
 	// We need the source entries to resolve "Identical" file references (negative indices)
@@ -1270,24 +1260,7 @@ func applyPlainXdelta3Delta(ctx context.Context, sourceSnap, delta, targetSnap s
 }
 
 // // run command in context, ensure commans is terminated if context is cancelled
-func runService(cmd *exec.Cmd, verbose bool) error {
-	if verbose {
-		// if Stdout is already set, we write to BOTH that and os.Stdout.
-		// otherwise just set it to os.Stdout.
-		if cmd.Stdout != nil {
-			cmd.Stdout = io.MultiWriter(cmd.Stdout, os.Stdout)
-		} else {
-			cmd.Stdout = os.Stdout
-		}
-
-		// Handle Stderr (usually essential for debugging/progress):
-		if cmd.Stderr != nil {
-			cmd.Stderr = io.MultiWriter(cmd.Stderr, os.Stderr)
-		} else {
-			cmd.Stderr = os.Stderr
-		}
-	}
-
+func runService(cmd *exec.Cmd) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
