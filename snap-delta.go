@@ -212,10 +212,13 @@ func main() {
 			generateCmd.Usage()
 			log.Fatal("Missing required parameters for 'generate'")
 		}
-		// default to xdelta3
-		deltaTool := defaultDeltaTool
+		var deltaTool uint16
 		if hdiffzTool {
 			deltaTool = DeltaToolHdiffz
+		} else if xdelta3Tool {
+			deltaTool = DeltaToolXdelta3
+		} else {
+			log.Fatal("missing delta tool setting for generate operation")
 		}
 		fmt.Printf("requested delta tool: 0x%X\n", deltaTool)
 		err = handleGenerateDelta(ctx, genSource, genTarget, genDelta, deltaTool)
@@ -1419,7 +1422,7 @@ func CheckSupportedDeltaFormats(ctx context.Context) (string, DeltaToolingCmd, D
 	if hpatch.err != nil {
 		return snapDeltaFormatXdelta3 + "," + xdelta3Format, xdelta.cmd, mksq.cmd, unsq.cmd, nil, nil, fmt.Errorf("hdpatch tools missing")
 	}
-	// we might be still missing hdiffz, but we can apply delta, which matters, we catch missing hdiffz if we need delta generation
+	// we might be still missing hdiffz, but we can apply delta, which matters
 	return snapDeltaFormatHdiffz + "," + snapDeltaFormatXdelta3 + "," + xdelta3Format,
 		xdelta.cmd, mksq.cmd, unsq.cmd, hdiff.cmd, hpatch.cmd, nil
 }
