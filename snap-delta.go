@@ -1173,7 +1173,7 @@ func setupPipes(pipeNames ...string) (string, []string, error) {
 }
 
 // Check if all the required tools are actually present
-// returns ready to use commands for xdelta3, hdiffz, hpatchz, mksquashfs and unsquashfs
+// returns ready to use commands for xdelta3, mksquashfs and unsquashfs, hdiffz, hpatchz
 func CheckSupportedDetlaFormats(ctx context.Context) (string, DeltaToolingCmd, DeltaToolingCmd, DeltaToolingCmd, DeltaToolingCmd, DeltaToolingCmd, error) {
 	// Run checks in parallel to speed up startup
 	type res struct {
