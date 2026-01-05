@@ -19,8 +19,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
-	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // snap delta support
@@ -1372,7 +1372,7 @@ func setupPipes(pipeNames ...string) (string, []string, error) {
 	var pipePaths []string
 	for _, name := range pipeNames {
 		pipePath := filepath.Join(tempDir, name)
-		if err := syscall.Mkfifo(pipePath, 0600); err != nil {
+		if err := unix.Mkfifo(pipePath, 0600); err != nil {
 			os.RemoveAll(tempDir) // cleanup
 			return "", nil, fmt.Errorf("failed to create fifo %s: %w", pipePath, err)
 		}
@@ -1486,7 +1486,8 @@ type ReusableMemFD struct {
 }
 
 func NewReusableMemFD(name string) (*ReusableMemFD, error) {
-	fd, err := memfdCreate(name, 0)
+	// create mem backed file
+	fd, err := unix.MemfdCreate(name, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1500,7 +1501,7 @@ func NewReusableMemFD(name string) (*ReusableMemFD, error) {
 
 func (m *ReusableMemFD) Reset() error {
 	// Truncate file to 0 size
-	if err := syscall.Ftruncate(m.Fd, 0); err != nil {
+	if err := unix.Ftruncate(m.Fd, 0); err != nil {
 		return err
 	}
 	// Seek to start
@@ -1510,19 +1511,6 @@ func (m *ReusableMemFD) Reset() error {
 
 func (m *ReusableMemFD) Close() {
 	m.File.Close() // This closes the FD as well
-}
-
-// create mem backed file
-func memfdCreate(name string, flags int) (int, error) {
-	s, err := syscall.BytePtrFromString(name)
-	if err != nil {
-		return 0, err
-	}
-	r1, _, e1 := syscall.Syscall(syscall.SYS_MEMFD_CREATE, uintptr(unsafe.Pointer(s)), uintptr(flags), 0)
-	if e1 != 0 {
-		return 0, e1
-	}
-	return int(r1), nil
 }
 
 // Loads timestamp, compression, and flags from a squashfs superblock.
@@ -1715,7 +1703,7 @@ func runWithContext(ctx context.Context, cmd *exec.Cmd) error {
 	if atomic.LoadUint32(&ctxDone) != 0 {
 		// do one last check to make sure the error from Wait is what we expect from Kill
 		if err, ok := err.(*exec.ExitError); ok {
-			if ws, ok := err.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signal() == syscall.SIGKILL {
+			if ws, ok := err.ProcessState.Sys().(unix.WaitStatus); ok && ws.Signal() == unix.SIGKILL {
 				return ctx.Err()
 			}
 		}
