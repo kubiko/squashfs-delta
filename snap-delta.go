@@ -1422,7 +1422,7 @@ func CheckSupportedDeltaFormats(ctx context.Context) (string, DeltaToolingCmd, D
 	if hpatch.err != nil {
 		return snapDeltaFormatXdelta3 + "," + xdelta3Format, xdelta.cmd, mksq.cmd, unsq.cmd, nil, nil, fmt.Errorf("hdpatch tools missing")
 	}
-	// we might be still missing hdiffz, but we can apply delta, which matters
+	// we might be still missing hdiffz, but we can apply delta, which matters, we catch missing hdiffz if we need delta generation
 	return snapDeltaFormatHdiffz + "," + snapDeltaFormatXdelta3 + "," + xdelta3Format,
 		xdelta.cmd, mksq.cmd, unsq.cmd, hdiff.cmd, hpatch.cmd, nil
 }
