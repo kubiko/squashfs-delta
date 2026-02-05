@@ -99,6 +99,15 @@ const (
 	squashfsMagicNumber = uint32(0x73717368)
 )
 
+// Fuzzy matching tuning parameters
+const (
+	FuzzyMinSimilarityThreshold = 25
+	FuzzyMaxLookaheadIndex      = 20
+	FuzzyMaxFileSizeDeltaPerc   = 20
+	FuzzyMaxFileSizeScore       = 10
+	FuzzyExactFileDirMarchScore = 10
+)
+
 // Snap delta format constants
 const (
 	// Delta Header Configuration
@@ -810,24 +819,26 @@ LOOP:
 			// We must select a candidate that is physically AHEAD in the stream as cannot rewind the source pipe
 			// We do not want to advance too much either, it could be false "match"
 			// assuming we compare software, allow "version" change in fuzzy match
-			// find first fuzzy match, max 20 entries eahead
+			// find first fuzzy match, max MaxLookaheadIndex entries eahead
 			// build score from different criteria
-			//  - exact basefilename match: or exact directory match: 10
-			//  - size +-20% difference: up to 10
-			//  - index delta from last index: 20 - index delta
-			// if score > 25 it's match
-			lookout := min(lastSourceIndex+20, sourceEntriesCount) // which ever is smaller
+			//  - exact basefilename match: or exact directory match: FuzzyExactFileDirMarchScore
+			//  - size +-MaxFileSizeDeltaPerc% difference: up to MaxFileSizeScore points
+			//  - index delta from last index: MaxLookaheadIndex - index delta
+			// if score > FuzzyMinSimilarityThreshold it's match
+			lookout := min(lastSourceIndex+FuzzyMaxLookaheadIndex, sourceEntriesCount) // which ever is smaller
 			for i := lastSourceIndex + 1; i < lookout; i++ {
 				se := sourceEntries[i]
 				fuzzyMatch := pathsMatchFuzzy(se.FilePath, te.FilePath)
 				if fuzzyMatch != 0 {
 					// build the rest of the score
-					score := getSimilarityScore(se.DataSize, te.DataSize, 20) / 10
-					score += 20 + lastSourceIndex + 1 - i
+					score := getSimilarityScore(se.DataSize, te.DataSize, FuzzyMaxFileSizeDeltaPerc) / FuzzyMaxFileSizeScore
+					// add look ahead score
+					score += FuzzyMaxLookaheadIndex + lastSourceIndex + 1 - i
+					// less then 3 matchis means either file name or dir path match exactly
 					if fuzzyMatch < 3 {
-						score += 10
+						score += FuzzyExactFileDirMarchScore
 					}
-					if score > 25 {
+					if score > FuzzyMinSimilarityThreshold {
 						fmt.Printf("Fuzzy Match(%d): %s matched with old %s\n", score, te.FilePath, se.FilePath)
 						sourceEntry = &sourceEntries[i]
 						break
@@ -1600,7 +1611,7 @@ func pathsMatchFuzzy(pathA, pathB string) int {
 	for i := 0; i < len(partsA); i++ {
 		partA := partsA[i]
 		partB := partsB[i]
-		// idential, next one
+		// identical, next one
 		if partA == partB {
 			continue
 		}
