@@ -987,6 +987,7 @@ func applyHdiffzDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap
 	mksquashArgs := append([]string{
 		"-", targetSnap, "-pf", "-", "-noappend", "-quiet",
 	}, mksqfsHdrArgs...)
+	mksquashArgs = append(mksquashArgs, mksquashfsTuningApply...)
 	mksquashCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/mksquashfs", mksquashArgs...)
 	if err != nil {
 		return fmt.Errorf("cannot find mksquashfs: %w", err)
