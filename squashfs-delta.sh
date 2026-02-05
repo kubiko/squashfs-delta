@@ -1,12 +1,13 @@
 #!/bin/bash
 
 DELTA_HEADER_SIZE=32 # bytes
-DELTA_FORMAT_VERSION=0x101
-DELTA_MAGIC_NUMBER=0xF989789C
+DELTA_FORMAT_VERSION=0x01
+DELTA_TOOLING_VERSION=0x01
+DELTA_MAGIC_NUMBER=0x66707173
 XDELTA3_MAGIC_NUMBER=0x00c4c3d6
 DELTA_TOOL_XDELTA3="0x1"
-DELTA_TOOL_BSDIFF="0x12"     // different strategy to go implementation, diffing entire pf
-DELTA_TOOL_HDIFFPATCH="0x13" // different strategy to go implementation, diffing entire pf
+DELTA_TOOL_BSDIFF="0x12"     # different strategy to go implementation, diffing entire pf
+DELTA_TOOL_HDIFFPATCH="0x13" # different strategy to go implementation, diffing entire pf
 DEFAULT_DELTA_TOOL="${DELTA_TOOL_XDELTA3}"
 
 ##
@@ -32,8 +33,8 @@ HPATCHZ="${TOOLBOX_SNAP}/usr/bin/hpatchz"
 
 # Custom Delta header (padded to DELTA_HEADER_SIZE size)
 # generated delta is using following custom header to capture the delta content
-# |       32b    |   16b   |     16b    |    32b     |     16b     |        16b        |
-# | magic number | version | delta tool | time stamp | compression | super block flags |
+# |       32b    |    8b    |    8b   |     16b    |     32b    |     16b     |        16b        |
+# | magic number | format v | tools v | delta tool | time stamp | compression | super block flags |
 # reference squashfs supperblock https://dr-emann.github.io/squashfs
 # Optional compressor options are currently not supported, if target squashfs is detected to
 # use those, we fallback to plain xdelta
@@ -167,7 +168,7 @@ handle_generate_delta() {
   done
   seek_count=$((seek_count + 4))
   # store delta version: DELTA_FORMAT_VERSION
-  for b in $((DELTA_FORMAT_VERSION & 255)) $(((DELTA_FORMAT_VERSION >> 8) & 255))
+  for b in $((DELTA_FORMAT_VERSION & 255)) $((DELTA_TOOLING_VERSION & 255))
   do
     printf "%b" "$(printf '\\%03o' "$b")" >> "$DELTA"
   done
@@ -237,9 +238,14 @@ handle_apply_delta() {
     echo "Wrong magic number!!!"
     exit
   fi
-  version_number="0x$(od --address-radix n --format x2 --skip-bytes 4 --read-bytes 2 "${DELTA}" | xargs)"
+  version_number="0x$(od --address-radix n --format x2 --skip-bytes 4 --read-bytes 1 "${DELTA}" | xargs)"
   if (( DELTA_FORMAT_VERSION != version_number )); then
     echo "Missmatch delta version number!!!"
+    exit
+  fi
+  version_number="0x$(od --address-radix n --format x2 --skip-bytes 5 --read-bytes 1 "${DELTA}" | xargs)"
+  if (( DELTA_TOOLING_VERSION != version_number )); then
+    echo "Missmatch delta tooling version number!!!"
     exit
   fi
 
