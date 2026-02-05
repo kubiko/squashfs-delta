@@ -172,7 +172,8 @@ var (
 	// mksquashfs tuning
 	// by default mksquashfs can grab up to 25% of the physical memory
 	// limit this as we migh run on contrained systems
-	mksquashfsTuningApply = []string{"-mem-percent", "10"}
+	// 3% on 500MB system -> 15MB limit does not seem to have measurable impact
+	mksquashfsTuningApply = []string{"-mem-percent", "3"}
 
 	// IO buffer size for efficient piping (1MB)
 	CopyBufferSize = 1024 * 1024
@@ -629,6 +630,7 @@ func applyXdelta3Delta(ctx context.Context, sourceSnap, targetSnap string, delta
 	mksquashArgs := append([]string{
 		"-", targetSnap, "-pf", "-", "-noappend", "-quiet",
 	}, mksqfsHdrArgs...)
+	mksquashArgs = append(mksquashArgs, mksquashfsTuningApply...)
 	mksquashCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/mksquashfs", mksquashArgs...)
 	if err != nil {
 		return fmt.Errorf("cannot find mksquashfs: %w", err)
