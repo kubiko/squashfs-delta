@@ -1132,13 +1132,18 @@ LOOP:
 			// do we need to skip some data in the source stream?
 			skip := neededOffset - sourceReadCursor
 			if skip > 0 {
-				copyNBuffer(io.Discard, sourceReader, skip)
+				fmt.Printf("OK: skipping data in the source: [%s]\n", entry.FilePath)
+				if _, err := copyNBuffer(io.Discard, sourceReader, skip); err != nil {
+					errCh <- fmt.Errorf("failed to skip data in the source: %w", err)
+					cancel()
+					break LOOP
+				}
 				sourceReadCursor += skip
 			}
 
 			// ready to pump data from source stream to -> mksquashfs
 			if _, err := copyNBuffer(targetStdin, sourceReader, srcEntry.DataSize); err != nil {
-				errCh <- fmt.Errorf("failed to copy source data for %s: %w", entry.FilePath, err)
+				errCh <- fmt.Errorf("failed to copy source data for %s: [%w]", entry.FilePath, err)
 				cancel()
 				break LOOP
 			}
@@ -1184,7 +1189,11 @@ LOOP:
 
 				skip := srcOffset - sourceReadCursor
 				if skip > 0 {
-					copyNBuffer(io.Discard, sourceReader, skip)
+					if _, err := copyNBuffer(io.Discard, sourceReader, skip); err != nil {
+						errCh <- fmt.Errorf("failed to skip data in the source: %w", err)
+						cancel()
+						break LOOP
+					}
 					sourceReadCursor += skip
 				}
 
