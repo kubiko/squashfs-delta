@@ -1543,13 +1543,17 @@ func wrapErr(err error, msg string) error {
 	return fmt.Errorf("%s failed: %w", msg, err)
 }
 
-// ReusableMemFD wraps the file descriptor logic to reuse resources
+// ReusableMemFD wraps a file descriptor that can be reset and reused.
+// It prioritizes RAM-backed storage (memfd) but falls back to disk (temp file)
+// if memory is constrained.
 type ReusableMemFD struct {
-	Fd   int
-	File *os.File
-	Path string
+	Fd         int
+	File       *os.File
+	Path       string
+	isDiskFile bool
 }
 
+// NewReusableMemFD creates a reusable file, preferring RAM but falling back to disk.
 func NewReusableMemFD(name string) (*ReusableMemFD, error) {
 	// create mem backed file
 	fd, err := unix.MemfdCreate(name, 0)
@@ -1558,24 +1562,53 @@ func NewReusableMemFD(name string) (*ReusableMemFD, error) {
 	}
 	// Wrap in os.File for easy Go IO, but we manage the FD manually mostly
 	return &ReusableMemFD{
-		Fd:   fd,
-		File: os.NewFile(uintptr(fd), name),
-		Path: fmt.Sprintf("/proc/self/fd/%d", fd),
+		Fd:         fd,
+		File:       os.NewFile(uintptr(fd), name),
+		Path:       fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), fd),
+		isDiskFile: false,
+	}, nil
+
+	// try to create a standard Disk-backed temporary file as fallback
+	// fallback on all MemfdCreate errors to increase compatibility
+	tmpFile, err := os.CreateTemp("", fmt.Sprintf("snap-delta-%s-", name))
+	if err != nil {
+		return nil, fmt.Errorf("memfd creation failed and disk fallback failed: %w", err)
+	}
+
+	return &ReusableMemFD{
+		Fd:         int(tmpFile.Fd()),
+		File:       tmpFile,
+		Path:       tmpFile.Name(), // Use the actual file path on disk
+		isDiskFile: true,
 	}, nil
 }
 
+// Reset clears the file content and rewinds the cursor to 0.
 func (m *ReusableMemFD) Reset() error {
 	// Truncate file to 0 size
-	if err := unix.Ftruncate(m.Fd, 0); err != nil {
-		return err
+	if err := m.File.Truncate(0); err != nil {
+		return fmt.Errorf("truncate failed: %w", err)
 	}
 	// Seek to start
-	_, err := m.File.Seek(0, 0)
-	return err
+	if _, err := m.File.Seek(0, 0); err != nil {
+		return fmt.Errorf("seek failed: %w", err)
+	}
+	return nil
 }
 
-func (m *ReusableMemFD) Close() {
-	m.File.Close() // This closes the FD as well
+// Close closes the file descriptor and cleans up temporary files if necessary.
+func (m *ReusableMemFD) Close() error {
+	closeErr := m.File.Close() // This closes the FD as well
+
+	// If we used a fallback disk file, delete it (memfd is automatically cleaned up by the kernel)
+	if m.isDiskFile {
+		if rmErr := os.Remove(m.Path); rmErr != nil {
+			if closeErr == nil {
+				return fmt.Errorf("failed to remove temp file %s: %w", m.Path, rmErr)
+			}
+		}
+	}
+	return closeErr
 }
 
 // compIdToMksquashfsArgs converts SquashFS compression ID to a name.
