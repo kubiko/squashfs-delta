@@ -166,7 +166,8 @@ var (
 	// - generating delta: runs on server side -> no tuning, we have memory
 	// - apply delta: maybe low spec systems, limit data and fragment queues sizes
 	unsquashfsTuningGenerate = []string{"-da", "128", "-fr", "128"}
-	unsquashfsTuningApply    = []string{"-da", "8", "-fr", "8"}
+	// 3% on 500MB system -> 15MB limit does not seem to have measurable impact
+	unsquashfsTuningApply = []string{"-mem-percent", "3"}
 
 	// mksquashfs tuning
 	// by default mksquashfs can grab up to 25% of the physical memory
@@ -609,8 +610,9 @@ func applyXdelta3Delta(ctx context.Context, sourceSnap, targetSnap string, delta
 	deltaPipe := pipes[1]
 
 	// Output to srcPipe, -pf stands for pseudo-file representation
-	unsquashCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/unsquashfs",
-		"-no-progress", "-pf", srcPipe, sourceSnap)
+	unsquashSrcArg := append([]string{}, unsquashfsTuningApply...)
+	unsquashSrcArg = append(unsquashSrcArg, "-no-progress", "-pf", srcPipe, sourceSnap)
+	unsquashCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/unsquashfs", unsquashSrcArg...)
 	if err != nil {
 		return fmt.Errorf("cannot find unsquashfs: %w", err)
 	}
@@ -959,13 +961,14 @@ func applyHdiffzDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap
 
 	// Start Source Stream (unsquashfs)
 	// We read FROM this pipe
-	// Output to srcPipe, -pf stands for pseudo-file representation
-	sourceCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/unsquashfs",
-		"-no-progress", "-pf", "-", sourceSnap)
+	// Output to stdout '-', -pf stands for pseudo-file representation
+	unsquashSrcArg := append([]string{}, unsquashfsTuningApply...)
+	unsquashSrcArg = append(unsquashSrcArg, "-no-progress", "-pf", "-", sourceSnap)
+	unsquashCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/unsquashfs", unsquashSrcArg...)
 	if err != nil {
 		return fmt.Errorf("cannot find unsquashfs: %w", err)
 	}
-	sourcePipe, err := sourceCmd.StdoutPipe()
+	sourcePipe, err := unsquashCmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create source pipe: %w", err)
 	}
@@ -1000,7 +1003,7 @@ func applyHdiffzDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if err := runWithContext(ctx, sourceCmd); err != nil {
+		if err := runWithContext(ctx, unsquashCmd); err != nil {
 			select {
 			case errCh <- wrapErr(err, "unsquashfs"):
 			default:
@@ -1132,7 +1135,6 @@ LOOP:
 			// do we need to skip some data in the source stream?
 			skip := neededOffset - sourceReadCursor
 			if skip > 0 {
-				fmt.Printf("OK: skipping data in the source: [%s]\n", entry.FilePath)
 				if _, err := copyNBuffer(io.Discard, sourceReader, skip); err != nil {
 					errCh <- fmt.Errorf("failed to skip data in the source: %w", err)
 					cancel()
