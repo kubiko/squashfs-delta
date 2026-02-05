@@ -334,15 +334,15 @@ func GenerateDelta(sourceSnap, targetSnap, delta string, deltaFormat DeltaFormat
 		// Plain xdelta3 on compressed files
 		return generatePlainXdelta3Delta(ctx, sourceSnap, targetSnap, delta)
 	case SnapXdelta3Format:
-		return generateSnapDelta(ctx, sourceSnap, targetSnap, delta, DeltaToolXdelta3)
+		return generateSnapDelta(ctx, cancel, sourceSnap, targetSnap, delta, DeltaToolXdelta3)
 	case SnapHdiffzFormat:
-		return generateSnapDelta(ctx, sourceSnap, targetSnap, delta, DeltaToolHdiffz)
+		return generateSnapDelta(ctx, cancel, sourceSnap, targetSnap, delta, DeltaToolHdiffz)
 	default:
 		return fmt.Errorf("unsupported delta format %d", deltaFormat)
 	}
 }
 
-func generateSnapDelta(ctx context.Context, sourceSnap, targetSnap, delta string, deltaFormat uint16) error {
+func generateSnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap, targetSnap, delta string, deltaFormat uint16) error {
 	fmt.Println("Generating delta...")
 
 	// Build delta header, using the target header
@@ -371,7 +371,7 @@ func generateSnapDelta(ctx context.Context, sourceSnap, targetSnap, delta string
 	case DeltaToolXdelta3:
 		err = generateXdelta3Delta(ctx, deltaFile, sourceSnap, targetSnap)
 	case DeltaToolHdiffz:
-		err = generateHdiffzDelta(ctx, deltaFile, sourceSnap, targetSnap)
+		err = generateHdiffzDelta(ctx, cancel, deltaFile, sourceSnap, targetSnap)
 	default:
 		err = fmt.Errorf("unsupported delta tool 0x%X", hdr.DeltaTool)
 	}
@@ -420,13 +420,13 @@ func ApplyDelta(sourceSnap, delta, targetSnap string) error {
 		if err := binary.Read(bytes.NewReader(buf), binary.LittleEndian, hdr); err != nil {
 			return fmt.Errorf("cannot decode header: %w", err)
 		}
-		return applySnapDelta(ctx, sourceSnap, targetSnap, deltaFile, hdr)
+		return applySnapDelta(ctx, cancel, sourceSnap, targetSnap, deltaFile, hdr)
 	default:
 		return fmt.Errorf("unknown delta file format")
 	}
 }
 
-func applySnapDelta(ctx context.Context, sourceSnap, targetSnap string, deltaFile *os.File, hdr *SnapDeltaHeader) error {
+func applySnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap, targetSnap string, deltaFile *os.File, hdr *SnapDeltaHeader) error {
 	if hdr.Magic != deltaMagicNumber {
 		return fmt.Errorf("invalid magic 0x%X", hdr.Magic)
 	}
@@ -455,7 +455,7 @@ func applySnapDelta(ctx context.Context, sourceSnap, targetSnap string, deltaFil
 	case DeltaToolXdelta3:
 		return applyXdelta3Delta(ctx, sourceSnap, targetSnap, deltaFile, mksqfsArgs)
 	case DeltaToolHdiffz:
-		return applyHdiffzDelta(ctx, sourceSnap, targetSnap, deltaFile, mksqfsArgs)
+		return applyHdiffzDelta(ctx, cancel, sourceSnap, targetSnap, deltaFile, mksqfsArgs)
 	default:
 		return fmt.Errorf("unsupported delta tool 0x%X", hdr.DeltaTool)
 	}
@@ -665,11 +665,7 @@ func applyXdelta3Delta(ctx context.Context, sourceSnap, targetSnap string, delta
 }
 
 // --- Hdiffz Implementations ---
-func generateHdiffzDelta(ctx context.Context, deltaFile *os.File, sourceSnap, targetSnap string) error {
-	// Setup Context & WaitGroup
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
+func generateHdiffzDelta(ctx context.Context, cancel context.CancelFunc, deltaFile *os.File, sourceSnap, targetSnap string) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 3)
 
@@ -957,11 +953,7 @@ LOOP:
 	return nil
 }
 
-func applyHdiffzDelta(ctx context.Context, sourceSnap, targetSnap string, deltaFile *os.File, mksqfsHdrArgs []string) error {
-	// Setup Context & WaitGroup
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
+func applyHdiffzDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap, targetSnap string, deltaFile *os.File, mksqfsHdrArgs []string) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 3)
 
