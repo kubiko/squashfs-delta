@@ -1301,55 +1301,74 @@ func unescape(s string) string {
 	return b.String()
 }
 
-func parsePseudoDefinitionLine(line string) []string {
-	// find first space not preceded by escape
+// parsePseudoDefinitionLine splits a line into [Filename, Type, ...Args].
+// It handles filenames with escaped spaces (e.g., "My\ File R ...").
+func parsePseudoDefinitionLine(line string) ([]string, error) {
+	// 1. Find the delimiter: the first space NOT preceded by a backslash
 	splitIdx := -1
 	for i := 0; i < len(line); i++ {
-		if line[i] == ' ' && (i == 0 || line[i-1] != '\\') {
-			splitIdx = i
-			break
+		if line[i] == ' ' {
+			if i == 0 || line[i-1] != '\\' {
+				splitIdx = i
+				break
+			}
 		}
 	}
 
+	// Handle case with no valid delimiter (e.g., just a filename)
 	if splitIdx == -1 {
-		return []string{unescape(line)}
+		// Valid pseudo-definitions usually require at least Name + Type + Metadata.
+		// We return an error to signal the caller to skip this line.
+		return nil, fmt.Errorf("insufficient fields (no delimiter found)")
 	}
 
+	// 2. Extract and unescape the filename
 	name := unescape(line[:splitIdx])
+
+	// 3. Extract the metadata fields (standard space-separated)
 	rest := strings.Fields(line[splitIdx+1:])
 
-	// Pre-allocate slice
-	out := make([]string, 1, len(rest)+1)
-	out[0] = name
-	out = append(out, rest...)
-	return out
+	// 4. Construct result: [Name, Type, ...Rest]
+	// Pre-allocate slice for efficiency
+	result := make([]string, 0, 1+len(rest))
+	result = append(result, name)
+	result = append(result, rest...)
+
+	// Basic validation: Original code expected at least 3 parts (Name, Type, +1 info)
+	if len(result) < 3 {
+		return nil, fmt.Errorf("insufficient fields (got %d, expected >=3)", len(result))
+	}
+
+	return result, nil
 }
 
-// parsePseudoStream encapsulates the logic to read the mixed text/binary stream
+// parsePseudoStream encapsulates the logic to read the mixed text/binary stream.
+// It stops reading exactly at the end of the text header definition to allow
+// subsequent binary reads from the same reader.
 func parsePseudoStream(reader *bufio.Reader) ([]PseudoEntry, *bytes.Buffer, error) {
-
-	// 2. Storage for parsed data
 	var entries []PseudoEntry
+
 	headerBuffer := bufferPool.Get().(*bytes.Buffer)
 	headerBuffer.Reset()
+
 	headerEnd := false
 
 	for {
-		// Read until the next newline (Text Mode)
+		// ReadBytes is used instead of Scanner to prevent over-buffering.
+		// We must not read past the newline of the last header line.
 		lineBytes, err := reader.ReadBytes('\n')
 		if err != nil && err != io.EOF {
-			return nil, nil, fmt.Errorf("Stream read error: %v", err)
+			return nil, nil, fmt.Errorf("stream read error: %w", err)
 		}
 
-		// If we got no bytes and EOF, we are done
+		// Store raw line in header buffer (includes the newline)
+		headerBuffer.Write(lineBytes)
+
+		// Stop if we hit EOF and have no data left
 		if len(lineBytes) == 0 && err == io.EOF {
 			break
 		}
 
-		// Store this raw line in our header buffer
-		headerBuffer.Write(lineBytes)
-
-		// Trim whitespace for parsing
 		lineStr := string(lineBytes)
 		trimmed := strings.TrimSpace(lineStr)
 
@@ -1358,61 +1377,64 @@ func parsePseudoStream(reader *bufio.Reader) ([]PseudoEntry, *bytes.Buffer, erro
 			if err == io.EOF {
 				break
 			}
+			continue
 		}
+
+		// Handle Comments and Control Markers
 		if trimmed[0] == '#' {
-			// is this the comment after "# START OF DATA - DO NOT MODIFY"
+			// Terminate logic: matches original behavior.
+			// If we already saw the "# START OF DATA" marker, and this is *another* comment,
+			// we assume the header is finished.
 			if headerEnd {
 				break
 			}
-			// detect if this is end of the header "# START OF DATA - DO NOT MODIFY"
+
+			// Check for the specific start-of-data marker
 			if trimmed == "# START OF DATA - DO NOT MODIFY" {
-				// read one more line and break
 				headerEnd = true
 				continue
 			}
-		}
 
-		// Parse the Text Line
-		fields := parsePseudoDefinitionLine(trimmed)
-		if len(fields) < 3 {
-			// Handle malformed lines gracefully
+			// Regular comment, ignore
 			if err == io.EOF {
 				break
 			}
 			continue
 		}
 
-		entry := PseudoEntry{
-			FilePath: fields[0],
-			Type:     fields[1],
-		}
-
-		// Logic to handle different types
-		switch entry.Type {
-		// ignore all the types without inline data
-		// D: Directory, S: Symbolic Link, L: hard link, C: Char device
-		// x: extended security capability
-		case "D", "S", "L", "C", "x":
+		// Parse the definition line
+		fields, parseErr := parsePseudoDefinitionLine(trimmed)
+		if parseErr != nil {
+			// In the original logic, malformed lines (len < 3) were ignored silently.
+			// We continue here to preserve that tolerance, unless it's EOF.
+			if err == io.EOF {
+				break
+			}
 			continue
-
-		// R: Regular File with INLINE DATA
-		// Format: Path  Type  Time  Mode  UID  GID  Size  Offset  XattrIndex
-		case "R":
-			var parseErr error
-			// Format: FilePath R Time Mode UID GID Size Offset <>
-			entry.DataSize, parseErr = strconv.ParseInt(fields[6], 10, 64)
-			if parseErr != nil {
-				log.Fatalf("Invalid data size: %v", parseErr)
-			}
-			entry.DataOffset, parseErr = strconv.ParseInt(fields[7], 10, 64)
-			if parseErr != nil {
-				log.Fatalf("Invalid data offset: %v", parseErr)
-			}
-		default:
-			return nil, nil, fmt.Errorf("unknown type in pseudo definition: %s", trimmed)
 		}
 
-		entries = append(entries, entry)
+		// We only process "R" (Regular File) entries for Delta generation
+		// Format: FilePath | Type | Time | Mode | UID | GID | Size | Offset
+		if fields[1] == "R" {
+			if len(fields) < 8 {
+				return nil, nil, fmt.Errorf("malformed 'R' entry (expected >=8 fields, got %d): %s", len(fields), trimmed)
+			}
+
+			entry := PseudoEntry{
+				FilePath: fields[0],
+				Type:     fields[1],
+			}
+
+			var convErr error
+			if entry.DataSize, convErr = strconv.ParseInt(fields[6], 10, 64); convErr != nil {
+				return nil, nil, fmt.Errorf("invalid size in entry %s: %w", entry.FilePath, convErr)
+			}
+			if entry.DataOffset, convErr = strconv.ParseInt(fields[7], 10, 64); convErr != nil {
+				return nil, nil, fmt.Errorf("invalid offset in entry %s: %w", entry.FilePath, convErr)
+			}
+
+			entries = append(entries, entry)
+		}
 
 		if err == io.EOF {
 			break
