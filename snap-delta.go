@@ -99,15 +99,6 @@ const (
 	squashfsMagicNumber = uint32(0x73717368)
 )
 
-// Fuzzy matching tuning parameters
-const (
-	FuzzyMinSimilarityThreshold = 25
-	FuzzyMaxLookaheadIndex      = 20
-	FuzzyMaxFileSizeDeltaPerc   = 20
-	FuzzyMaxFileSizeScore       = 10
-	FuzzyExactFileDirMarchScore = 10
-)
-
 // Snap delta format constants
 const (
 	// Delta Header Configuration
@@ -184,6 +175,15 @@ var (
 
 	// IO buffer size for efficient piping (1MB)
 	CopyBufferSize = 1024 * 1024
+)
+
+// Fuzzy matching tuning parameters
+const (
+	FuzzyMinSimilarityThreshold = 25
+	FuzzyMaxLookaheadIndex      = 20
+	FuzzyMaxFileSizeDeltaPerc   = 20
+	FuzzyMaxFileSizeScore       = 10
+	FuzzyExactFileDirMarchScore = 10
 )
 
 // For testing purposes
