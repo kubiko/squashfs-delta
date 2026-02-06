@@ -700,6 +700,9 @@ func generateHdiffzDelta(ctx context.Context, cancel context.CancelFunc, deltaFi
 
 	// prepare hpatchz
 	hdiffzCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/hdiffz", "")
+	if err != nil {
+		return fmt.Errorf("cannot find hdiffz: %w", err)
+	}
 	hdiffzPath := hdiffzCmd.Path
 
 	wg.Add(2)
@@ -999,6 +1002,10 @@ func applyHdiffzDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap
 
 	// prepare hpatchz
 	hpatchzCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/hpatchz", "")
+	if err != nil {
+		return fmt.Errorf("cannot find hpatchz: %w", err)
+	}
+
 	hpatchzPath := hpatchzCmd.Path
 
 	// unsquash source
