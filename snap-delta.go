@@ -730,14 +730,21 @@ func generateHdiffzDelta(ctx context.Context, cancel context.CancelFunc, deltaFi
 		}
 	}()
 
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
 	sp, err := os.Open(sourcePipe)
 	if err != nil {
 		return fmt.Errorf("failed to open source pipe:%v", err)
 	}
+	defer sp.Close()
 	tp, err := os.Open(targetPipe)
 	if err != nil {
 		return fmt.Errorf("failed to open target pipe:%v", err)
 	}
+	defer tp.Close()
 	sourceReader := bufio.NewReaderSize(sp, CopyBufferSize)
 	targetReader := bufio.NewReaderSize(tp, CopyBufferSize)
 
@@ -973,13 +980,15 @@ func applyHdiffzDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap
 	if err != nil {
 		return fmt.Errorf("cannot find unsquashfs: %w", err)
 	}
-	sourcePipe, err := unsquashCmd.StdoutPipe()
+	pr, pw, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("failed to create source pipe: %w", err)
 	}
+	defer pr.Close()
+	unsquashCmd.Stdout = pw
 
 	// Wrap source in a buffered reader for efficient seeking/skipping
-	sourceReader := bufio.NewReaderSize(sourcePipe, CopyBufferSize)
+	sourceReader := bufio.NewReaderSize(pr, CopyBufferSize)
 
 	// Source from stdin (-), create targetSnap, pseudo-file from stdin
 	// (-pf -), not append to existing filesystem, quiet, append additional
@@ -1013,6 +1022,7 @@ func applyHdiffzDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		defer pw.Close()
 		if err := runWithContext(ctx, unsquashCmd); err != nil {
 			select {
 			case errCh <- wrapErr(err, "unsquashfs"):
