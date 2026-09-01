@@ -263,6 +263,36 @@ func cmdInspect(ctx context.Context, paths []string) error {
 		fmt.Printf("  meta   [%d,%d) = %d bytes on disk, %d blocks (%d raw), %d bytes uncompressed\n",
 			sb.InodeTableStart, sb.ExportTableStart, sb.ExportTableStart-sb.InodeTableStart,
 			len(reg.Blocks), mraw, len(reg.Blob))
+		// The tree is only used to match a target run against source bytes, so
+		// it is reported rather than enforced: an inode the walk misses costs
+		// delta size and nothing else.
+		tree, err := im.FileTree(reg)
+		if err != nil {
+			fmt.Printf("  tree   UNWALKABLE: %v\n", err)
+		} else {
+			inodes, err := im.FileInodes(ctx)
+			if err != nil {
+				return err
+			}
+			named := make(map[uint32]bool, len(tree))
+			var withBlocks int
+			for _, e := range tree {
+				named[e.Inode.Number] = true
+			}
+			for _, fi := range inodes {
+				if len(fi.Sizes) != 0 {
+					withBlocks++
+				}
+			}
+			missing := 0
+			for _, fi := range inodes {
+				if !named[fi.Number] {
+					missing++
+				}
+			}
+			fmt.Printf("  tree   %d paths over %d file inodes (%d with blocks), %d unnamed\n",
+				len(tree), len(inodes), withBlocks, missing)
+		}
 		fmt.Printf("  tail   [%d,%d) = %d bytes\n  pad    %d bytes\n\n",
 			sb.ExportTableStart, sb.BytesUsed, sb.BytesUsed-sb.ExportTableStart,
 			im.Size()-int64(sb.BytesUsed))

@@ -554,6 +554,60 @@ func (im *SquashfsImage) FileInodes(ctx context.Context) ([]*FileInode, error) {
 	return out, nil
 }
 
+// FileBlock is one of a file's data blocks together with where it sits in that
+// file's plaintext.
+//
+// The plaintext offset is what makes two revisions comparable. Between them a
+// file's blocks change length, change count and move on disk, but the byte at
+// plaintext offset n is still roughly the byte at plaintext offset n -- so it is
+// the coordinate the generator uses to line a changed target run up against the
+// source. See blockplan_match.go.
+type FileBlock struct {
+	Extent
+	// UOff is the block's offset within the file's uncompressed contents,
+	// counting sparse holes, which occupy plaintext but no disk.
+	UOff int64
+}
+
+// inodeExtents returns one inode's data blocks in file order.
+func (im *SquashfsImage) inodeExtents(fi *FileInode) ([]FileBlock, error) {
+	bsz := uint64(im.SB.BlockSize)
+	out := make([]FileBlock, 0, len(fi.Sizes))
+	off := fi.StartBlock
+	var uOff int64
+	remaining := fi.FileSize
+	for _, w := range fi.Sizes {
+		uSize := bsz
+		if remaining < bsz {
+			uSize = remaining
+		}
+		remaining -= uSize
+		if w == 0 {
+			// A sparse hole occupies no bytes on disk. It survives
+			// through the inode's size word, which the metadata patch
+			// carries, so the assembler emits nothing for it -- but it
+			// does occupy plaintext, so the file offset moves on.
+			uOff += int64(uSize)
+			continue
+		}
+		cSize := int(w & ^dataUncompressedBit)
+		e := Extent{
+			Offset: off,
+			CSize:  cSize,
+			USize:  int(uSize),
+			Raw:    w&dataUncompressedBit != 0,
+		}
+		if e.Raw && e.CSize != e.USize {
+			return nil, fmt.Errorf("raw block at %d occupies %d bytes but is %d uncompressed",
+				off, e.CSize, e.USize)
+		}
+		out = append(out, FileBlock{Extent: e, UOff: uOff})
+		off += int64(cSize)
+		uOff += int64(uSize)
+	}
+	return out, nil
+}
+
 // Extents returns every distinct data block in the image, sorted by offset.
 //
 // Distinct matters: mksquashfs deduplicates identical files, so several inodes
@@ -565,45 +619,23 @@ func (im *SquashfsImage) Extents(ctx context.Context) ([]Extent, error) {
 	if err != nil {
 		return nil, err
 	}
-	bsz := uint64(im.SB.BlockSize)
 	type key struct {
 		off   int64
 		cSize int
 	}
 	seen := make(map[key]Extent, 1024)
 	for _, fi := range inodes {
-		off := fi.StartBlock
-		remaining := fi.FileSize
-		for _, w := range fi.Sizes {
-			uSize := bsz
-			if remaining < bsz {
-				uSize = remaining
-			}
-			remaining -= uSize
-			if w == 0 {
-				// A sparse hole occupies no bytes on disk. It
-				// survives through the inode's size word, which
-				// the metadata patch carries, so the assembler
-				// emits nothing for it.
-				continue
-			}
-			cSize := int(w & ^dataUncompressedBit)
-			e := Extent{
-				Offset: off,
-				CSize:  cSize,
-				USize:  int(uSize),
-				Raw:    w&dataUncompressedBit != 0,
-			}
-			if e.Raw && e.CSize != e.USize {
-				return nil, fmt.Errorf("inode %d: raw block at %d occupies %d bytes but is %d uncompressed",
-					fi.Number, off, e.CSize, e.USize)
-			}
-			if prev, ok := seen[key{off, cSize}]; ok && prev.USize != e.USize {
+		blocks, err := im.inodeExtents(fi)
+		if err != nil {
+			return nil, fmt.Errorf("inode %d: %w", fi.Number, err)
+		}
+		for _, b := range blocks {
+			k := key{b.Offset, b.CSize}
+			if prev, ok := seen[k]; ok && prev.USize != b.USize {
 				return nil, fmt.Errorf("block at %d is shared with disagreeing uncompressed sizes %d and %d",
-					off, prev.USize, e.USize)
+					b.Offset, prev.USize, b.USize)
 			}
-			seen[key{off, cSize}] = e
-			off += int64(cSize)
+			seen[k] = b.Extent
 		}
 	}
 	out := make([]Extent, 0, len(seen))
