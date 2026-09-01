@@ -1895,7 +1895,7 @@ func main() {
 	var xdelta3Tool, hdiffzTool, blocksFormat bool
 	var genThreads, genMaxRun, genMinSaving int
 	var genNoVerify, genNoPatchRuns, genNoPathMatch, genRunLog bool
-	var genWindowRatio, genMinSavingRate float64
+	var genWindowRatio, genMinSavingRate, genWindowBack float64
 	var appReport bool
 	var appMaxRun int
 	generateCmd := flag.NewFlagSet("generate", flag.ExitOnError)
@@ -1911,7 +1911,7 @@ func main() {
 	generateCmd.IntVar(&genThreads, "threads", 0, "xz thread count, at least 2 (0 = default)")
 	generateCmd.IntVar(&genMaxRun, "max-run", 0, "cap on the plaintext one patch run reconstructs, which bounds apply memory (0 = default)")
 	generateCmd.BoolVar(&genNoVerify, "no-verify", false, "skip running the applier over the finished delta (--blocks only)")
-	// The five that follow drive the cost model from the command line, which is
+	// The six that follow drive the cost model from the command line, which is
 	// how its defaults were measured; nothing but a sweep should pass them. The
 	// run log is how a sweep's result gets read: an aggregate report says what a
 	// delta cost, not which runs cost it.
@@ -1920,6 +1920,7 @@ func main() {
 	generateCmd.Float64Var(&genWindowRatio, "window-ratio", 0, "source window size as a multiple of a run's plaintext (0 = default)")
 	generateCmd.Float64Var(&genMinSavingRate, "min-saving-rate", 0, "delta bytes a run must save per byte of plaintext it makes the device compress (0 = default)")
 	generateCmd.IntVar(&genMinSaving, "min-saving", -1, "fewest delta bytes a run must save to be worth compressing for at all (-1 = default, 0 = no floor)")
+	generateCmd.Float64Var(&genWindowBack, "window-back", -1, "fraction of a source window placed before its anchor rather than after it (-1 = default)")
 	generateCmd.BoolVar(&genRunLog, "run-log", false, "print one line per patch run on stderr: its plaintext, its window and what the patch cost")
 
 	applyCmd := flag.NewFlagSet("apply", flag.ExitOnError)
@@ -1976,7 +1977,9 @@ func main() {
 				WindowRatio:   genWindowRatio,
 				MinSavingRate: genMinSavingRate,
 				MinSaving:     genMinSaving,
-				RunLog:        genRunLog,
+
+				WindowBackFrac: genWindowBack,
+				RunLog:         genRunLog,
 			})
 			break
 		}

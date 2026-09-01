@@ -47,10 +47,11 @@ type patchRunTuning struct {
 	// neighbourhood, since that is what the patch matches against.
 	WindowRatio float64
 	// MinSaving is the fewest bytes a run must save over the equivalent
-	// literals to be worth any device compression at all. This one is about
-	// process overhead, not the trade: a run costs three forks (hdiffz here,
-	// xz -dc and xz on the device), so a trivial gain is not worth having
-	// however good its rate looks.
+	// literals to be worth any device compression at all. It is about process
+	// overhead rather than the trade -- a run costs three forks (hdiffz here,
+	// xz -dc and xz on the device) -- and the measurements below say that
+	// overhead does not materialise, so it defaults to no floor and is kept as
+	// a dial for a caller who has a device that says otherwise.
 	MinSaving int
 	// MinSavingRate is the trade itself: the delta bytes a run must save per
 	// byte of plaintext it makes the device compress. A relative
@@ -59,6 +60,11 @@ type patchRunTuning struct {
 	// 3 MiB of compression -- so the rate is the primary filter and
 	// MaxCostRatio is only a backstop.
 	MinSavingRate float64
+	// WindowBackFrac is how much of a window sits before its anchor rather
+	// than after it, as a fraction of the window. 0 is the forward-only
+	// placement; 0.5 centres the window on the anchor. It exists because the
+	// anchor is a guess, and it is measured at 0 -- see the default below.
+	WindowBackFrac float64
 	// MaxCostRatio is the largest patch-to-literal size ratio still worth
 	// compressing for: 0.9 means a run must come in at least 10% under the
 	// literals it replaces. A run that fails this is not saving anything
@@ -85,10 +91,44 @@ func defaultPatchRunTuning(maxRunUSize int) patchRunTuning {
 		// places to find a mediocre match. 1.5 is within 3% of the best delta
 		// the ratio can reach while decompressing a fifth less than 2.0 does.
 		WindowRatio: 1.5,
-		// Load-bearing, and about process overhead rather than the trade: a
-		// gadget revision's whole change is a single 10.6 KiB run, which this
-		// declines, and the delta is 11.3 KiB either way.
-		MinSaving: 16 << 10,
+		// Measured, and the answer is that the window should not reach
+		// backwards at all. The hypothesis was that a window only reaching
+		// forward misses content that moved later within a large file, and
+		// bench/m10-window-back.sh refutes it on all five pairs: 0, 0.1 and
+		// 0.25 land within 0.1% of each other -- on imx-kernel 3,486,147 /
+		// 3,483,920 / 3,483,009, on post75 -> post77 544,423 / 545,551 /
+		// 546,517 -- and 0.4 and 0.5 are then ruinous, taking imx-kernel to
+		// 7.24 and 13.95 MiB and post61 -> post60 from 100,705 bytes to 1.39
+		// and 2.74 MiB.
+		//
+		// The reason is that the two directions are not symmetric. Budget spent
+		// behind the anchor is budget not spent ahead of it, and a file's
+		// plaintext runs forward from the offset the anchor names, so the match
+		// is nearly always ahead. Backing off trades a certain loss for a
+		// speculative gain. The dial stays because it is cheap and it records
+		// the negative result; it should be left at 0.
+		WindowBackFrac: 0,
+		// Measured, and it earns nothing. The floor was 16 KiB on the argument
+		// that a small run's three forks cost more than compressing its few
+		// blocks, with a gadget revision -- whose entire change is one 10.6 KiB
+		// run -- as the case in point. bench/m10-floor-cost.sh times the apply
+		// instead of assuming, and that pair rebuilds in 0.04 seconds whether
+		// the run is patched or shipped whole, while the floor costs it a factor
+		// of ten in delta size (1,083 bytes against 11,571).
+		//
+		// The larger pairs agree. Dropping the floor to 0 takes post75 ->
+		// post77 from 1,729,885 bytes to 544,423, post61 -> post60 from
+		// 1,147,575 to 100,705 and post77 -> post129 from 5,382,710 to
+		// 3,657,582, for 1.9, 1.6 and 3.3 more seconds of apply CPU -- and even
+		// that is mostly the 7% more plaintext the extra runs compress, not the
+		// forks. It is what makes the format's delta smaller than
+		// snap-1-1-Hdiffz's on every pair rather than several times larger,
+		// while still applying four times cheaper.
+		//
+		// Nothing trivial gets through, because MinSavingRate is the real floor
+		// and unlike this one it scales with the work asked: a run of a single
+		// 128 KiB block has to save 2.6 KiB to pass it.
+		MinSaving: 0,
 		// A floor rather than a tuner, and the sweeps say where the floor
 		// belongs. Read the rate's effect as an exchange: bytes of device
 		// compression avoided per byte the delta grows. On 8.13.2.post77 ->
@@ -124,6 +164,58 @@ type srcWindowPicker struct {
 
 func newSrcWindowPicker(src *SquashfsImage, ext []Extent) *srcWindowPicker {
 	return &srcWindowPicker{src: src, ext: ext}
+}
+
+// windowAround returns a window of at most maxU bytes of source plaintext
+// positioned so that back bytes of it, at most, precede anchor.
+//
+// The anchor says where the run's plaintext is expected to live, but "expected"
+// is doing real work: within a single large file whose contents shifted -- a FIT
+// image whose compressed kernel changed size, a tarball, an ext4 blob -- the
+// corresponding source bytes can sit either side of the offset that names them.
+// A window that only reaches forward finds the match when the content moved
+// earlier and misses it entirely when it moved later, and a miss costs the full
+// price: the run's patch degenerates to roughly its own plaintext.
+//
+// Nothing about correctness depends on where the window sits. It is source
+// plaintext handed to hdiffz, which reports what it could not match; a badly
+// placed window makes a large patch, not a wrong one.
+func (p *srcWindowPicker) windowsAround(anchor int64, maxU, back int) ([]SrcWindow, bool) {
+	w, ok := p.windowsFrom(p.backOff(anchor, back), maxU)
+	if ok {
+		return w, true
+	}
+	// Backing off cannot itself lose a window -- rounding forward from a lower
+	// offset can only find more blocks -- but the anchor may have sat past the
+	// last source block, and then neither offset yields one.
+	return p.windowsFrom(anchor, maxU)
+}
+
+// backOff returns the offset of the earliest source block that leaves at most
+// back bytes of plaintext between it and off.
+//
+// Walking blocks rather than subtracting is the whole point: the window's budget
+// is denominated in plaintext, while an anchor is an on-disk offset, and the two
+// differ by whatever the compressor achieved -- around 2:1 on a snap, but not
+// uniformly, so no single ratio converts one to the other.
+func (p *srcWindowPicker) backOff(off int64, back int) int64 {
+	if back <= 0 {
+		return off
+	}
+	i := sort.Search(len(p.ext), func(k int) bool { return p.ext[k].Offset >= off })
+	acc := 0
+	for i > 0 {
+		e := p.ext[i-1]
+		if acc+e.USize > back {
+			break
+		}
+		acc += e.USize
+		i--
+	}
+	if i == len(p.ext) {
+		return off
+	}
+	return p.ext[i].Offset
 }
 
 // windowsFrom returns windows covering at most maxU bytes of source plaintext,
@@ -282,12 +374,16 @@ func buildPatchRun(ctx context.Context, tgt *SquashfsImage, run *candidateRun, p
 		return nil, nil
 	}
 
-	wins, ok := pick.windowsFrom(run.srcAnchor, maxWinU)
+	// The window's budget beyond the run's own plaintext is what pays for the
+	// anchor being approximate, and WindowBackFrac decides how much of that
+	// slack looks backwards.
+	back := int(float64(maxWinU) * tune.WindowBackFrac)
+	wins, ok := pick.windowsAround(run.srcAnchor, maxWinU, back)
 	kind := run.anchoredBy
 	if !ok && run.srcAnchor != run.srcFallback {
 		// The anchor sat past the last source block, which is what a file that
 		// lives near the end of the source looks like when the target grew.
-		wins, ok = pick.windowsFrom(run.srcFallback, maxWinU)
+		wins, ok = pick.windowsAround(run.srcFallback, maxWinU, back)
 		kind = anchorNone
 	}
 	if !ok {

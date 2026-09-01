@@ -419,12 +419,21 @@ func TestRunWorthCompressing(t *testing.T) {
 	tests := []struct {
 		name                          string
 		patch, literal, uTotal, would int
-		want                          bool
+		// floor overrides MinSaving, which the default leaves at 0 because the
+		// apply timings said the process overhead it was guarding against does
+		// not show up. The dial still has to work for the caller who wants it.
+		floor int
+		want  bool
 	}{
 		{name: "a small patch replacing large literals", patch: 2000, literal: 300000, uTotal: 600000, want: true},
-		// Under the absolute floor, this is not worth three forks whatever its
-		// rate looks like.
-		{name: "saving below the process overhead", patch: 1000, literal: 9000, uTotal: 20000},
+		// Its rate and ratio are both fine, so only an explicit floor refuses
+		// it -- and by default nothing does.
+		{name: "a small saving, floor set", patch: 1000, literal: 9000, uTotal: 20000, floor: 16 << 10},
+		{name: "a small saving, no floor", patch: 1000, literal: 9000, uTotal: 20000, want: true},
+		// What keeps the floorless default from accepting anything at all: a
+		// whole block of plaintext recompressed to save 100 bytes fails the
+		// rate, which unlike a byte floor scales with the work asked.
+		{name: "a trivial saving on a full block", patch: 1000, literal: 1100, uTotal: 128 << 10},
 		// Above the floor but the device would compress 2 MiB to save 20 KB of
 		// delta, which is the trade MinSavingRate exists to refuse.
 		{name: "a good ratio at a bad rate", patch: 80000, literal: 100000, uTotal: 2000000},
@@ -435,6 +444,10 @@ func TestRunWorthCompressing(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			tune := tune
+			if tc.floor != 0 {
+				tune.MinSaving = tc.floor
+			}
 			if got := runWorthCompressing(tc.patch, tc.literal, tc.uTotal, tune); got != tc.want {
 				t.Errorf("runWorthCompressing(patch=%d, literal=%d, uTotal=%d) = %v, want %v",
 					tc.patch, tc.literal, tc.uTotal, got, tc.want)

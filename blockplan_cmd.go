@@ -138,6 +138,9 @@ type genCmdOpts struct {
 	WindowRatio   float64
 	MinSavingRate float64
 	MinSaving     int
+	// WindowBackFrac is a fraction, so negative leaves it alone: zero is the
+	// meaningful setting that places the whole window after the anchor.
+	WindowBackFrac float64
 	// RunLog asks for one line per patch run on stderr, which is how a bad
 	// run gets told apart from a run whose content really changed.
 	RunLog bool
@@ -148,10 +151,13 @@ func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string
 	// The sweeps drive the cost model from the command line; everything else
 	// leaves it alone.
 	var tune *patchRunTuning
-	if o.WindowRatio > 0 || o.MinSavingRate != 0 || o.MinSaving >= 0 {
+	if o.WindowRatio > 0 || o.MinSavingRate != 0 || o.MinSaving >= 0 || o.WindowBackFrac >= 0 {
 		t := defaultPatchRunTuning(o.MaxRun)
 		if o.WindowRatio > 0 {
 			t.WindowRatio = o.WindowRatio
+		}
+		if o.WindowBackFrac >= 0 {
+			t.WindowBackFrac = min(o.WindowBackFrac, 0.9)
 		}
 		if o.MinSavingRate != 0 {
 			t.MinSavingRate = max(o.MinSavingRate, 0)
