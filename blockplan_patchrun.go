@@ -179,12 +179,22 @@ type candidateRun struct {
 	// ext is the target's blocks, in ascending offset.
 	ext []Extent
 	// srcAnchor is where in the source the run's plaintext is expected to
-	// live: the source offset just past the block the preceding OP_COPY
-	// matched. It is the generator's whole idea of correspondence at this
-	// milestone -- consecutive revisions keep near-monotonic layouts, so the
-	// bytes bracketed by two matches are the source's version of what changed
-	// between them.
+	// live, and so where its window starts. It comes from the path matcher
+	// when the run's first block belongs to a file the source also has: the
+	// same plaintext offset of the same file is the closest thing to a
+	// correspondence two revisions have.
 	srcAnchor int64
+	// srcFallback is the offset-proximity guess -- the source offset just
+	// past the block the preceding OP_COPY matched. Consecutive revisions
+	// keep near-monotonic layouts, so the bytes bracketed by two matches are
+	// usually the source's version of what changed between them. It stands in
+	// when no path correspondence was found, and it is retried when the
+	// anchor yields no window at all, which costs nothing: picking a window
+	// is index arithmetic, and only the chosen one is ever decompressed.
+	srcFallback int64
+	// anchoredBy records which of the two the anchor came from, for the
+	// generator's report. It says nothing about the delta's correctness.
+	anchoredBy anchorKind
 }
 
 // USizeTotal is the plaintext the run reconstructs.
@@ -244,9 +254,24 @@ func buildPatchRun(ctx context.Context, tgt *SquashfsImage, run *candidateRun, p
 	}
 
 	win, ok := pick.window(run.srcAnchor, maxWinU)
+	kind := run.anchoredBy
+	if !ok && run.srcAnchor != run.srcFallback {
+		// The anchor sat past the last source block, which is what a file that
+		// lives near the end of the source looks like when the target grew.
+		win, ok = pick.window(run.srcFallback, maxWinU)
+		kind = anchorNone
+	}
 	if !ok {
 		stats.RunsNoWindow++
 		return nil, nil
+	}
+	switch kind {
+	case anchorPath:
+		stats.RunsPathAnchored++
+	case anchorFuzzy:
+		stats.RunsFuzzyAnchored++
+	default:
+		stats.RunsCursorAnchored++
 	}
 
 	old, err := pick.src.DecompressExtents(ctx, pick.extentsIn(win))

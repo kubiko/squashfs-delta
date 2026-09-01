@@ -75,6 +75,17 @@ type genStats struct {
 	RunBlockMismatches int
 	RunsRejectedBytes  int64
 
+	// Where the patch runs' source windows came from: the same path in the
+	// source, a path differing only in its digits, or the offset-proximity
+	// fallback. A high cursor share means the path map is not reaching the
+	// files that churn, which shows up as a larger delta and nothing else.
+	RunsPathAnchored   int
+	RunsFuzzyAnchored  int
+	RunsCursorAnchored int
+	// MatchUnavailable is why path correspondence could not be built at all,
+	// empty when it was. Generation continues without it.
+	MatchUnavailable string
+
 	MetaBlocks   int
 	MetaUBytes   int64
 	MDPatchBytes int
@@ -102,6 +113,10 @@ type blockPlanGenOpts struct {
 	// patch runs are measured against, and a fallback if a patch tool is
 	// unavailable.
 	NoPatchRuns bool
+	// NoPathMatch anchors every run by offset proximity alone, which is what
+	// the format did before the directory tables were read. It is the baseline
+	// the path matcher is measured against.
+	NoPathMatch bool
 	// Tuning replaces the whole patch-run cost model. Nil takes the defaults,
 	// which is what everything but the sweeps and the tests wants.
 	Tuning *patchRunTuning
@@ -218,7 +233,20 @@ func generateBlockPlan(ctx context.Context, sourcePath, targetPath, deltaPath st
 		tune.MaxRunUSize = opts.MaxRunUSize
 	}
 	tune.Disabled = tune.Disabled || opts.NoPatchRuns
-	if err := emitDataRegion(ctx, tgt, tgtExt, index, pick, enc, payw, tune, opts, stats); err != nil {
+
+	// Path correspondence is an optimisation, not a requirement: it only picks
+	// which source bytes a run is diffed against. An image whose directory table
+	// this code cannot walk still gets a correct delta, just a larger one, so the
+	// failure is recorded and generation carries on.
+	var match *pathMatcher
+	if !opts.NoPathMatch {
+		match, err = newPathMatcher(ctx, src, tgt, srcMeta, tgtMeta)
+		if err != nil {
+			stats.MatchUnavailable = err.Error()
+			match = nil
+		}
+	}
+	if err := emitDataRegion(ctx, tgt, tgtExt, index, pick, match, enc, payw, tune, opts, stats); err != nil {
 		return nil, err
 	}
 	stats.Instructions = enc.Count()
@@ -355,7 +383,7 @@ func (idx *extentIndex) find(want []byte, srcCursor int64) (Extent, bool) {
 // because it needs the run's whole plaintext, both to diff it and to prove the
 // blocks recompress.
 func emitDataRegion(ctx context.Context, tgt *SquashfsImage, ext []Extent, idx *extentIndex,
-	pick *srcWindowPicker, enc *instrEncoder, pay *crcWriter, tune patchRunTuning,
+	pick *srcWindowPicker, match *pathMatcher, enc *instrEncoder, pay *crcWriter, tune patchRunTuning,
 	opts blockPlanGenOpts, stats *genStats) error {
 
 	// A copy can absorb the next block when both the target and the source
@@ -452,9 +480,16 @@ func emitDataRegion(ctx context.Context, tgt *SquashfsImage, ext []Extent, idx *
 			}
 		}
 		if len(run.ext) == 0 {
-			// The source cursor is where the preceding copy left off, so it
-			// points at the source's version of whatever changed next.
-			run.srcAnchor = srcCursor
+			// A run's window is chosen once, at its first block, so this is
+			// where correspondence is decided. The path matcher answers for
+			// that block's file; the source cursor -- where the preceding copy
+			// left off -- stands in when it cannot, and is retried if the
+			// anchor turns out to have no window.
+			run.srcFallback = srcCursor
+			run.srcAnchor, run.anchoredBy = srcCursor, anchorNone
+			if off, kind := match.anchor(e.Offset); kind != anchorNone {
+				run.srcAnchor, run.anchoredBy = off, kind
+			}
 		}
 		run.ext = append(run.ext, e)
 	}

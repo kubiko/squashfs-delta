@@ -121,26 +121,44 @@ func printApplyStats(s *applyStats, elapsed time.Duration) {
 		humanBytes(s.PeakScratchBytes))
 }
 
+// genCmdOpts is what the generate flags collect. It is a struct rather than a
+// parameter list because most of it exists for the sweeps, and a call site of
+// five bare booleans says nothing about which is which.
+type genCmdOpts struct {
+	Threads int
+	MaxRun  int
+	Verify  bool
+	// NoPatchRuns and NoPathMatch each turn off one half of the size
+	// optimisation, so a measurement can attribute what it buys.
+	NoPatchRuns bool
+	NoPathMatch bool
+	// WindowRatio and MinSavingRate override the cost model; zero leaves it at
+	// its default.
+	WindowRatio   float64
+	MinSavingRate float64
+}
+
 // cmdGenerateBlocks generates a block-plan delta and reports its composition.
-func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string, threads, maxRun int, verify, noPatchRuns bool, windowRatio, minSavingRate float64) error {
+func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string, o genCmdOpts) error {
 	// The sweeps drive the cost model from the command line; everything else
 	// leaves it alone.
 	var tune *patchRunTuning
-	if windowRatio > 0 || minSavingRate != 0 {
-		t := defaultPatchRunTuning(maxRun)
-		if windowRatio > 0 {
-			t.WindowRatio = windowRatio
+	if o.WindowRatio > 0 || o.MinSavingRate != 0 {
+		t := defaultPatchRunTuning(o.MaxRun)
+		if o.WindowRatio > 0 {
+			t.WindowRatio = o.WindowRatio
 		}
-		if minSavingRate != 0 {
-			t.MinSavingRate = max(minSavingRate, 0)
+		if o.MinSavingRate != 0 {
+			t.MinSavingRate = max(o.MinSavingRate, 0)
 		}
 		tune = &t
 	}
 	stats, err := generateBlockPlan(ctx, sourceSnap, targetSnap, delta, blockPlanGenOpts{
-		Comp:        &xzCLI{threads: threads},
-		MaxRunUSize: maxRun,
-		Verify:      verify,
-		NoPatchRuns: noPatchRuns,
+		Comp:        &xzCLI{threads: o.Threads},
+		MaxRunUSize: o.MaxRun,
+		Verify:      o.Verify,
+		NoPatchRuns: o.NoPatchRuns,
+		NoPathMatch: o.NoPathMatch,
 		Tuning:      tune,
 	})
 	if err != nil {
@@ -163,6 +181,13 @@ func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string
 			n, stats.RunsNoWindow, stats.RunsTooExpensive, stats.RunsVerifyFailed,
 			humanBytes(stats.RunsRejectedBytes))
 	}
+	if anchored := stats.RunsPathAnchored + stats.RunsFuzzyAnchored + stats.RunsCursorAnchored; anchored > 0 {
+		fmt.Printf("  anchored by    %d path, %d version-bump path, %d source offset\n",
+			stats.RunsPathAnchored, stats.RunsFuzzyAnchored, stats.RunsCursorAnchored)
+	}
+	if stats.MatchUnavailable != "" {
+		fmt.Printf("  no path map    %s\n", stats.MatchUnavailable)
+	}
 	fmt.Printf("  metadata       %d blocks, %s of plaintext, %s patch\n",
 		stats.MetaBlocks, humanBytes(stats.MetaUBytes), humanBytes(int64(stats.MDPatchBytes)))
 	// The headline. The old pseudo-file formats decompress the whole source and
@@ -174,7 +199,7 @@ func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string
 	fmt.Printf("  apply compresses %s of %s (%.1f%% avoided) and decompresses %s\n",
 		humanBytes(comp), humanBytes(whole), pct(whole-comp, whole),
 		humanBytes(stats.WindowUBytes))
-	if verify {
+	if o.Verify {
 		fmt.Printf("  verified       the delta reconstructs %s exactly\n", targetSnap)
 	}
 	return nil
