@@ -36,9 +36,6 @@ func applyBlockPlanToFile(ctx context.Context, sourceSnap string, delta io.Reade
 // applyBlockPlanReport applies a delta and optionally prints what the apply
 // cost, which is the number the format exists to reduce.
 func applyBlockPlanReport(ctx context.Context, sourceSnap string, delta io.Reader, targetSnap string, opts blockPlanApplyOpts, report bool) (*applyStats, error) {
-	if opts.Comp == nil {
-		opts.Comp = &xzCLI{}
-	}
 	src, err := os.Open(sourceSnap)
 	if err != nil {
 		return nil, err
@@ -172,7 +169,7 @@ func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string
 		runLog = os.Stderr
 	}
 	stats, err := generateBlockPlan(ctx, sourceSnap, targetSnap, delta, blockPlanGenOpts{
-		Comp:        &xzCLI{threads: o.Threads},
+		Threads:     o.Threads,
 		MaxRunUSize: o.MaxRun,
 
 		Verify:      o.Verify,

@@ -35,7 +35,8 @@ const testSourceSize = 1 << 30
 
 func decodeAll(t *testing.T, e *instrEncoder, sourceSize, maxRun int64) []Instruction {
 	t.Helper()
-	d := newInstrDecoder(e.Bytes(), testBlockSize, sourceSize, maxRun)
+	// The decoder's framing must be the encoder's, which is the compressor's.
+	d := newInstrDecoder(e.Bytes(), testBlockSize, sourceSize, maxRun, e.winSizes)
 	var out []Instruction
 	for !d.done() {
 		var in Instruction
@@ -52,7 +53,7 @@ func decodeAll(t *testing.T, e *instrEncoder, sourceSize, maxRun int64) []Instru
 
 func TestInstrRoundTrip(t *testing.T) {
 	const maxRun = 8 << 20
-	e := newInstrEncoder(testBlockSize)
+	e := newInstrEncoder(testBlockSize, false)
 
 	// A copy from exactly the cursor start, which must encode a zero delta.
 	if err := e.Copy(96, 1000); err != nil {
@@ -119,7 +120,7 @@ func TestInstrRoundTrip(t *testing.T) {
 
 	// The zero-delta cases must really be one byte each, or the source-cursor
 	// scheme is not buying anything.
-	e2 := newInstrEncoder(testBlockSize)
+	e2 := newInstrEncoder(testBlockSize, false)
 	if err := e2.Copy(96, 1<<20); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +148,7 @@ func TestInstrRejectsMalformed(t *testing.T) {
 		{"patchrun zero blocks", []byte{byte(opPatchRun), 0}},
 		{"patchrun block count beyond stream", []byte{byte(opPatchRun), 100}},
 		{"patchrun uSize at block size", func() []byte {
-			e := newInstrEncoder(testBlockSize)
+			e := newInstrEncoder(testBlockSize, false)
 			e.PatchRun([]PlanBlock{{USize: 4, CSize: 2}}, nil, 0)
 			b := append([]byte(nil), e.Bytes()...)
 			// Rewrite the encoded uSize from 4 to 0x80 0x80 0x08 (131072),
@@ -157,7 +158,7 @@ func TestInstrRejectsMalformed(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			d := newInstrDecoder(tc.buf, testBlockSize, testSourceSize, maxRun)
+			d := newInstrDecoder(tc.buf, testBlockSize, testSourceSize, maxRun, false)
 			var in Instruction
 			var err error
 			for !d.done() && err == nil {
@@ -173,11 +174,11 @@ func TestInstrRejectsMalformed(t *testing.T) {
 func TestInstrBoundsChecks(t *testing.T) {
 	// A copy past the end of the source must be refused even though it
 	// encoded fine, because on the device the stream is untrusted.
-	e := newInstrEncoder(testBlockSize)
+	e := newInstrEncoder(testBlockSize, false)
 	if err := e.Copy(1000, 500); err != nil {
 		t.Fatal(err)
 	}
-	d := newInstrDecoder(e.Bytes(), testBlockSize, 1200, 8<<20)
+	d := newInstrDecoder(e.Bytes(), testBlockSize, 1200, 8<<20, false)
 	var in Instruction
 	if err := d.Next(&in); err == nil {
 		t.Error("copy running past the end of the source was accepted")
@@ -186,19 +187,19 @@ func TestInstrBoundsChecks(t *testing.T) {
 	// Windows whose plaintext exceeds the cap must be refused: the applier
 	// holds all of it in memory at once, so this is a memory bound, not a
 	// formatting rule.
-	e = newInstrEncoder(testBlockSize)
+	e = newInstrEncoder(testBlockSize, false)
 	if err := e.PatchRun([]PlanBlock{{USize: 4096, CSize: 100}}, []SrcWindow{
 		{Off: 0, Len: 1 << 16, ULen: 20 << 20},
 	}, 10); err != nil {
 		t.Fatal(err)
 	}
-	d = newInstrDecoder(e.Bytes(), testBlockSize, testSourceSize, 8<<20)
+	d = newInstrDecoder(e.Bytes(), testBlockSize, testSourceSize, 8<<20, false)
 	if err := d.Next(&in); err == nil {
 		t.Error("a patch run whose windows decompress past the cap was accepted")
 	}
 
 	// A patch run over the run cap must be refused.
-	e = newInstrEncoder(testBlockSize)
+	e = newInstrEncoder(testBlockSize, false)
 	blocks := make([]PlanBlock, 100)
 	for i := range blocks {
 		blocks[i] = PlanBlock{USize: testBlockSize, CSize: 100}
@@ -206,7 +207,7 @@ func TestInstrBoundsChecks(t *testing.T) {
 	if err := e.PatchRun(blocks, nil, 10); err != nil {
 		t.Fatal(err)
 	}
-	d = newInstrDecoder(e.Bytes(), testBlockSize, testSourceSize, 8<<20)
+	d = newInstrDecoder(e.Bytes(), testBlockSize, testSourceSize, 8<<20, false)
 	if err := d.Next(&in); err == nil {
 		t.Error("patch run over the run cap was accepted")
 	}
@@ -268,7 +269,7 @@ func TestBlockPlanContainerRoundTrip(t *testing.T) {
 	w.addSection(secSB, sb)
 	w.addSection(secMDFrame, []byte{0x00, 0x80, 0x01})
 	w.addSection(secMDTail, []byte("tail"))
-	if err := w.addSectionXZ(ctx, secInstr, instr); err != nil {
+	if err := w.addSectionCompressed(ctx, secInstr, instr, &xzCLI{}); err != nil {
 		t.Fatal(err)
 	}
 	pay := bytes.Repeat([]byte{0x11, 0x22}, 4096)
@@ -396,6 +397,25 @@ func TestBlockPlanRejectsBadHeader(t *testing.T) {
 // FuzzInstrStream generates long random instruction streams, checks they survive
 // a round trip, and -- on arbitrary bytes -- that the decoder never panics or
 // accepts something out of bounds.
+// randomPartition splits n into between one and eight positive parts, which is
+// what a window's block sizes have to be: every part at least one byte, and the
+// whole summing to the window.
+func randomPartition(rng *rand.Rand, n int) []int {
+	parts := 1 + rng.Intn(8)
+	if parts > n {
+		parts = n
+	}
+	out := make([]int, 0, parts)
+	left := n
+	for i := 0; i < parts-1; i++ {
+		// Leave one byte for each remaining part.
+		take := 1 + rng.Intn(left-(parts-i-1))
+		out = append(out, take)
+		left -= take
+	}
+	return append(out, left)
+}
+
 func FuzzInstrStream(f *testing.F) {
 	f.Add([]byte{1, 2, 3, 4, 5, 6, 7, 8})
 	f.Add(bytes.Repeat([]byte{0xff}, 64))
@@ -408,7 +428,10 @@ func FuzzInstrStream(f *testing.F) {
 		}
 		rng := rand.New(rand.NewSource(s))
 		const maxRun = 8 << 20
-		e := newInstrEncoder(testBlockSize)
+		// Both window framings: a self-delimiting compressor records no block
+		// sizes inside a window, one that needs them records every one.
+		winSizes := rng.Intn(2) == 0
+		e := newInstrEncoder(testBlockSize, winSizes)
 		type expect struct {
 			op       opcode
 			srcOff   int64
@@ -459,6 +482,9 @@ func FuzzInstrStream(f *testing.F) {
 						// budget, so both invariant branches get exercised.
 						ULen: length + rng.Intn(winBudget-length+1),
 					}
+					if winSizes && !windows[j].Plain() {
+						windows[j].CSizes = randomPartition(rng, length)
+					}
 				}
 				patchLen := rng.Intn(maxRun)
 				if err := e.PatchRun(blocks, windows, patchLen); err != nil {
@@ -467,7 +493,7 @@ func FuzzInstrStream(f *testing.F) {
 				want = append(want, expect{op: opPatchRun, blocks: blocks, windows: windows, patchLen: patchLen})
 			}
 		}
-		d := newInstrDecoder(e.Bytes(), testBlockSize, testSourceSize, maxRun)
+		d := newInstrDecoder(e.Bytes(), testBlockSize, testSourceSize, maxRun, winSizes)
 		for i, wa := range want {
 			var in Instruction
 			if err := d.Next(&in); err != nil {
@@ -486,8 +512,13 @@ func FuzzInstrStream(f *testing.F) {
 				}
 			}
 			for j := range wa.windows {
-				if in.Windows[j] != wa.windows[j] {
-					t.Fatalf("instruction %d window %d: got %+v, want %+v", i, j, in.Windows[j], wa.windows[j])
+				gw, ww := in.Windows[j], wa.windows[j]
+				// Next reuses each window's size slice, so an empty one and a
+				// nil one mean the same thing.
+				if gw.Off != ww.Off || gw.Len != ww.Len || gw.ULen != ww.ULen ||
+					len(gw.CSizes) != len(ww.CSizes) ||
+					(len(ww.CSizes) > 0 && !reflect.DeepEqual(gw.CSizes, ww.CSizes)) {
+					t.Fatalf("instruction %d window %d: got %+v, want %+v", i, j, gw, ww)
 				}
 			}
 		}
@@ -498,7 +529,7 @@ func FuzzInstrStream(f *testing.F) {
 		// Now the garbage path: whatever the decoder does with the raw
 		// seed, it must not panic and must not hand back a reference
 		// outside the declared source.
-		gd := newInstrDecoder(seed, testBlockSize, 4096, maxRun)
+		gd := newInstrDecoder(seed, testBlockSize, 4096, maxRun, false)
 		for !gd.done() {
 			var in Instruction
 			if err := gd.Next(&in); err != nil {

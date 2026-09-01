@@ -92,11 +92,9 @@ func (b PlanBlock) Raw() bool { return b.CSize == b.USize }
 // than simply shipping the target block, and would cost the device a
 // recompression on top. So a window is decompressed before it is used.
 //
-// Off and Len address the on-disk bytes; ULen is what they decompress to. The
-// applier needs no block boundaries within the window: concatenated xz streams
-// decode in a single pass, so a window is one `xz -dc` regardless of how many
-// blocks it spans. That only holds while every block in it is compressed, which
-// is the generator's job to ensure.
+// Off and Len address the on-disk bytes; ULen is what they decompress to. Every
+// block in a window agrees on being compressed or being raw, which is the
+// generator's job to ensure.
 //
 // ULen == Len means the window is already plaintext and must not be
 // decompressed, which is how a run of raw-stored blocks is expressed. The
@@ -107,6 +105,20 @@ type SrcWindow struct {
 	Off  int64
 	Len  int
 	ULen int
+	// CSizes is each block's on-disk length, summing to Len.
+	//
+	// It is present exactly when the image's compressor reports
+	// NeedsBlockSizes, and only for a compressed window. Concatenated .xz
+	// streams are self-delimiting, so an xz window is one `xz -dc` however many
+	// blocks it spans and these sizes would be dead weight; an lzo block, by
+	// contrast, records its length nowhere at all, so without them a window of
+	// lzo blocks cannot be walked, let alone decoded.
+	//
+	// Which of the two applies is not recorded in the delta. It follows from the
+	// compressor id in SEC_SB, which the applier parses before it decodes a
+	// single instruction -- so the encoder and the decoder agree by both asking
+	// the same compressor.
+	CSizes []int
 }
 
 // Plain reports that the window's on-disk bytes are already plaintext.
@@ -181,10 +193,14 @@ type instrEncoder struct {
 	srcCur    int64
 	count     int
 	blockSize int
+	// winSizes mirrors the decompressor's NeedsBlockSizes: when set, each
+	// compressed source window carries its blocks' on-disk lengths. See
+	// SrcWindow.CSizes.
+	winSizes bool
 }
 
-func newInstrEncoder(blockSize int) *instrEncoder {
-	return &instrEncoder{srcCur: 96, blockSize: blockSize}
+func newInstrEncoder(blockSize int, winSizes bool) *instrEncoder {
+	return &instrEncoder{srcCur: 96, blockSize: blockSize, winSizes: winSizes}
 }
 
 // Bytes returns the encoded stream, and Count the number of instructions in it.
@@ -260,6 +276,28 @@ func (e *instrEncoder) PatchRun(blocks []PlanBlock, windows []SrcWindow, patchLe
 		e.u(uint64(w.Len))
 		// ULen >= Len always, so send the excess: zero for a plaintext window.
 		e.u(uint64(w.ULen - w.Len))
+		if !e.winSizes || w.Plain() {
+			if len(w.CSizes) != 0 {
+				return fmt.Errorf("patch run window %d carries %d block sizes that this compressor does not use",
+					i, len(w.CSizes))
+			}
+			continue
+		}
+		sum := 0
+		for _, c := range w.CSizes {
+			if c <= 0 {
+				return fmt.Errorf("patch run window %d: block of %d bytes", i, c)
+			}
+			sum += c
+		}
+		if len(w.CSizes) == 0 || sum != w.Len {
+			return fmt.Errorf("patch run window %d: %d block sizes sum to %d, not the window's %d bytes",
+				i, len(w.CSizes), sum, w.Len)
+		}
+		e.u(uint64(len(w.CSizes)))
+		for _, c := range w.CSizes {
+			e.u(uint64(c))
+		}
 	}
 	e.u(uint64(patchLen))
 	e.count++
@@ -277,12 +315,15 @@ type instrDecoder struct {
 	// sourceSize and maxRunUSize bound what the stream may ask for.
 	sourceSize  int64
 	maxRunUSize int64
+	// winSizes must be the encoder's, which means the image compressor's
+	// NeedsBlockSizes. See SrcWindow.CSizes.
+	winSizes bool
 }
 
-func newInstrDecoder(buf []byte, blockSize int, sourceSize, maxRunUSize int64) *instrDecoder {
+func newInstrDecoder(buf []byte, blockSize int, sourceSize, maxRunUSize int64, winSizes bool) *instrDecoder {
 	return &instrDecoder{
 		buf: buf, srcCur: 96, blockSize: blockSize,
-		sourceSize: sourceSize, maxRunUSize: maxRunUSize,
+		sourceSize: sourceSize, maxRunUSize: maxRunUSize, winSizes: winSizes,
 	}
 }
 
@@ -436,7 +477,44 @@ func (d *instrDecoder) Next(in *Instruction) error {
 					winUTotal, d.maxRunUSize)
 			}
 			d.srcCur = off + int64(length)
-			in.Windows = append(in.Windows, SrcWindow{Off: off, Len: int(length), ULen: int(uLen)})
+			// Reuse whatever slice this slot held for the previous instruction,
+			// so a stream of patch runs does not allocate per window.
+			var cs []int
+			if k := len(in.Windows); k < cap(in.Windows) {
+				cs = in.Windows[:k+1][k].CSizes[:0]
+			}
+			if d.winSizes && uLen != int64(length) {
+				nb, err := d.u()
+				if err != nil {
+					return err
+				}
+				// Each size costs at least one byte on the wire and describes at
+				// least one on-disk byte, so both remaining stream and window
+				// length bound the count before anything is appended.
+				if nb == 0 || nb > uint64(len(d.buf)-d.pos) || nb > length {
+					return fmt.Errorf("patch run window %d declares %d blocks in %d bytes", i, nb, length)
+				}
+				sum := uint64(0)
+				for j := uint64(0); j < nb; j++ {
+					c, err := d.u()
+					if err != nil {
+						return err
+					}
+					if c == 0 || sum+c > length {
+						return fmt.Errorf("patch run window %d block %d: %d bytes with %d of %d left",
+							i, j, c, length-sum, length)
+					}
+					sum += c
+					cs = append(cs, int(c))
+				}
+				if sum != length {
+					return fmt.Errorf("patch run window %d: %d blocks sum to %d, not the window's %d bytes",
+						i, nb, sum, length)
+				}
+			}
+			in.Windows = append(in.Windows, SrcWindow{
+				Off: off, Len: int(length), ULen: int(uLen), CSizes: cs,
+			})
 		}
 		patchLen, err := d.u()
 		if err != nil {

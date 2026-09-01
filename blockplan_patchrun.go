@@ -160,10 +160,13 @@ type srcWindowPicker struct {
 	// ext is every source block, sorted by offset and tiling the data region
 	// exactly, which CheckCoverage has already proved.
 	ext []Extent
+	// winSizes records each window's block lengths, for a compressor that needs
+	// them to decode one. See SrcWindow.CSizes.
+	winSizes bool
 }
 
 func newSrcWindowPicker(src *SquashfsImage, ext []Extent) *srcWindowPicker {
-	return &srcWindowPicker{src: src, ext: ext}
+	return &srcWindowPicker{src: src, ext: ext, winSizes: src.Dec.NeedsBlockSizes()}
 }
 
 // windowAround returns a window of at most maxU bytes of source plaintext
@@ -271,6 +274,12 @@ func (p *srcWindowPicker) windowsFrom(lo int64, maxU int) ([]SrcWindow, bool) {
 		}
 		out[cur].Len += e.CSize
 		out[cur].ULen += e.USize
+		// Only a compressed window's sizes are recorded, and only for a
+		// compressor that cannot find its own block boundaries. A raw window is
+		// plaintext already and is never decoded. See SrcWindow.CSizes.
+		if p.winSizes && !e.Raw {
+			out[cur].CSizes = append(out[cur].CSizes, e.CSize)
+		}
 		uTotal += e.USize
 		prevRaw = e.Raw
 	}

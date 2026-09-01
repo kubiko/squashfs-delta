@@ -345,7 +345,7 @@ func GenerateDelta(sourceSnap, targetSnap, delta string, deltaFormat DeltaFormat
 		return generateSnapDelta(ctx, cancel, sourceSnap, targetSnap, delta, DeltaToolHdiffz)
 	case SnapBlockPlanFormat:
 		_, err := generateBlockPlan(ctx, sourceSnap, targetSnap, delta,
-			blockPlanGenOpts{Comp: &xzCLI{}, Verify: true})
+			blockPlanGenOpts{Verify: true})
 		return err
 	default:
 		return fmt.Errorf("unsupported delta format %d", deltaFormat)
@@ -437,7 +437,7 @@ func ApplyDelta(sourceSnap, delta, targetSnap string) error {
 		if _, err := deltaFile.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
-		return applyBlockPlanToFile(ctx, sourceSnap, deltaFile, targetSnap, blockPlanApplyOpts{Comp: &xzCLI{}})
+		return applyBlockPlanToFile(ctx, sourceSnap, deltaFile, targetSnap, blockPlanApplyOpts{})
 	default:
 		return fmt.Errorf("unknown delta file format")
 	}

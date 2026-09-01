@@ -17,15 +17,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
-	"os/exec"
-	"strings"
 )
 
 // This file defines the snap-2-1-blocks delta container.
@@ -267,10 +264,15 @@ func (w *blockPlanWriter) addSection(id uint16, raw []byte) {
 	})
 }
 
-// addSectionXZ compresses raw with xz before storing it. Worth it only for the
-// instruction stream; the patch and payload sections are already compressed.
-func (w *blockPlanWriter) addSectionXZ(ctx context.Context, id uint16, raw []byte) error {
-	stored, err := xzCompressBlob(ctx, raw)
+// addSectionCompressed compresses raw with the image's own compressor before
+// storing it. Worth it only for the instruction stream; the patch and payload
+// sections are already compressed.
+//
+// Using the image's compressor rather than always xz is what keeps an apply's
+// tool requirements to exactly one compressor: the section is decoded by the
+// same code the blocks are.
+func (w *blockPlanWriter) addSectionCompressed(ctx context.Context, id uint16, raw []byte, comp Compressor) error {
+	stored, err := comp.CompressBlob(ctx, raw)
 	if err != nil {
 		return err
 	}
@@ -281,7 +283,7 @@ func (w *blockPlanWriter) addSectionXZ(ctx context.Context, id uint16, raw []byt
 	w.sections = append(w.sections, pendingSection{
 		entry: sectionEntry{
 			ID:        id,
-			Codec:     codecXZ,
+			Codec:     comp.SectionCodec(),
 			StoredLen: uint32(len(stored)),
 			RawLen:    uint32(len(raw)),
 			CRC:       crc32.ChecksumIEEE(stored),
@@ -416,12 +418,10 @@ func openBlockPlan(r io.Reader) (*blockPlanReader, error) {
 				return nil, fmt.Errorf("%s is stored uncompressed but declares raw length %d for %d stored bytes",
 					sectionName(e.ID), e.RawLen, e.StoredLen)
 			}
-		case codecXZ:
-			if raw, err = xzDecompressAll(context.Background(), stored, int(e.RawLen)); err != nil {
+		default:
+			if raw, err = decompressBlob(context.Background(), e.Codec, stored, int(e.RawLen)); err != nil {
 				return nil, fmt.Errorf("cannot decompress %s: %w", sectionName(e.ID), err)
 			}
-		default:
-			return nil, fmt.Errorf("%s uses unknown codec %d", sectionName(e.ID), e.Codec)
 		}
 		br.sections[e.ID] = raw
 	}
@@ -438,25 +438,20 @@ func (br *blockPlanReader) hasSection(id uint16) bool {
 	return ok
 }
 
-// --- whole-blob xz, for the instruction section ---
+// --- whole-blob section codecs ---
 
-// xzCompressBlob compresses a small blob as an ordinary .xz stream. This is
-// plain container-level compression and has nothing to do with reproducing
-// squashfs blocks.
-func xzCompressBlob(ctx context.Context, raw []byte) ([]byte, error) {
-	bin, err := toolPath("xz")
-	if err != nil {
-		return nil, err
+// decompressBlob undoes a section codec.
+//
+// It dispatches on the codec the section table records rather than on the
+// image's compressor, because sections are decoded before SEC_SB is even parsed
+// -- and because a codec is a property of the delta container, not of the image
+// the delta describes. Each compressor's SectionCodec names the one it writes.
+func decompressBlob(ctx context.Context, codec uint16, stored []byte, rawLen int) ([]byte, error) {
+	switch codec {
+	case codecXZ:
+		return xzDecompressAll(ctx, stored, rawLen)
 	}
-	cmd := exec.CommandContext(ctx, bin, "-c", "-q", "-9", "-T1", "--format=xz", "--check=crc32", "-")
-	cmd.Stdin = bytes.NewReader(raw)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("%s failed: %w: %s", bin, err, strings.TrimSpace(stderr.String()))
-	}
-	return out, nil
+	return nil, fmt.Errorf("unknown codec %d", codec)
 }
 
 // humanBytes formats a byte count for the messages this format reports sizes

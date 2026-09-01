@@ -97,7 +97,14 @@ type genStats struct {
 
 // blockPlanGenOpts configures generation.
 type blockPlanGenOpts struct {
+	// Comp overrides the compressor. Nil is the normal case and derives it from
+	// the target image's own superblock; a non-nil one must agree with that
+	// superblock, because a compressor that does not match the image produces
+	// blocks that are valid and wrong.
 	Comp Compressor
+	// Threads is a hint for the derived compressor, ignored by the in-process
+	// ones. Zero lets it decide.
+	Threads int
 	// HdiffzPath and HpatchzPath are the patch tool binaries; empty means
 	// look them up.
 	HdiffzPath  string
@@ -147,9 +154,6 @@ const defaultMaxRunUSize = 8 << 20
 // targetPath at deltaPath.
 func generateBlockPlan(ctx context.Context, sourcePath, targetPath, deltaPath string, opts blockPlanGenOpts) (*genStats, error) {
 	t0 := time.Now()
-	if opts.Comp == nil {
-		return nil, fmt.Errorf("no compressor configured")
-	}
 	if opts.MaxRunUSize == 0 {
 		opts.MaxRunUSize = defaultMaxRunUSize
 	}
@@ -174,7 +178,17 @@ func generateBlockPlan(ctx context.Context, sourcePath, targetPath, deltaPath st
 		return nil, fmt.Errorf("source uses %d-byte blocks and target %d", src.SB.BlockSize, tgt.SB.BlockSize)
 	}
 	if src.SB.CompressionId != tgt.SB.CompressionId {
-		return nil, fmt.Errorf("source uses compressor %d and target %d", src.SB.CompressionId, tgt.SB.CompressionId)
+		return nil, fmt.Errorf("source uses compressor %s and target %s",
+			compressorName(src.SB.CompressionId), compressorName(tgt.SB.CompressionId))
+	}
+	// The compressor comes from the image, so nothing has to be told what built
+	// it. An override is honoured only if it agrees with the superblock.
+	if opts.Comp == nil {
+		if opts.Comp, err = newCompressor(tgt.SB.CompressionId, opts.Threads); err != nil {
+			return nil, err
+		}
+	} else if err := checkCompressorMatches(opts.Comp, tgt.SB.CompressionId); err != nil {
+		return nil, err
 	}
 	blockSize := int(tgt.SB.BlockSize)
 	if opts.MaxRunUSize < blockSize {
@@ -230,7 +244,7 @@ func generateBlockPlan(ctx context.Context, sourcePath, targetPath, deltaPath st
 	defer pay.Close()
 	payw := newCRCWriter(pay.File)
 
-	enc := newInstrEncoder(blockSize)
+	enc := newInstrEncoder(blockSize, opts.Comp.NeedsBlockSizes())
 	index := indexExtents(src, srcExt)
 	pick := newSrcWindowPicker(src, srcExt)
 	tune := defaultPatchRunTuning(opts.MaxRunUSize)
@@ -293,7 +307,7 @@ func generateBlockPlan(ctx context.Context, sourcePath, targetPath, deltaPath st
 		w.addSection(secMDPatch, patch)
 	}
 	stats.InstrBytes = len(enc.Bytes())
-	if err := w.addSectionXZ(ctx, secInstr, enc.Bytes()); err != nil {
+	if err := w.addSectionCompressed(ctx, secInstr, enc.Bytes(), opts.Comp); err != nil {
 		return nil, err
 	}
 	for _, e := range w.sections {

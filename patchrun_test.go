@@ -220,7 +220,9 @@ func TestPatchRunSplitsAtRunCap(t *testing.T) {
 // Only data blocks are perturbed, so the metadata patch still applies and the
 // only thing under test is the data-block path.
 type sabotagingComp struct {
-	inner    Compressor
+	// Everything but CompressBlocks is the real compressor's: the method
+	// declared below shadows the promoted one.
+	Compressor
 	metaDict int
 	// blocks counts the data blocks perturbed, so a test can tell the
 	// sabotage happened rather than the run being declined for some other
@@ -228,12 +230,10 @@ type sabotagingComp struct {
 	blocks int
 }
 
-func (s *sabotagingComp) MaxBlocksPerCall() int { return s.inner.MaxBlocksPerCall() }
-
 func (s *sabotagingComp) CompressBlocks(ctx context.Context, plain BlockPlain, uSizes []int, dictSize int,
 	fn func(idx int, blk CompressedBlock) error) error {
 
-	return s.inner.CompressBlocks(ctx, plain, uSizes, dictSize, func(idx int, blk CompressedBlock) error {
+	return s.Compressor.CompressBlocks(ctx, plain, uSizes, dictSize, func(idx int, blk CompressedBlock) error {
 		// A raw block's on-disk bytes are its plaintext, so there is nothing
 		// in the compressor's output to corrupt.
 		if dictSize != s.metaDict && !blk.Raw && len(blk.OnDisk) > 8 {
@@ -268,7 +268,7 @@ func TestPatchRunDowngradesOnVerifyFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	comp := &sabotagingComp{inner: &xzCLI{}, metaDict: squashfsMetadataSize}
+	comp := &sabotagingComp{Compressor: &xzCLI{}, metaDict: squashfsMetadataSize}
 	if int(im.SB.BlockSize) == squashfsMetadataSize {
 		t.Fatalf("the fixture's block size equals the metadata dictionary, so the saboteur cannot tell them apart")
 	}
@@ -490,13 +490,12 @@ func TestRunWorthCompressing(t *testing.T) {
 // The bit flip keeps the block's length intact, so the applier's own cSize check
 // cannot see it either. Metadata is left alone, as in sabotagingComp.
 type flakyComp struct {
-	inner    Compressor
+	// As in sabotagingComp: only CompressBlocks is this type's own.
+	Compressor
 	metaDict int
 	seen     map[[32]byte]bool
 	spoiled  int
 }
-
-func (f *flakyComp) MaxBlocksPerCall() int { return f.inner.MaxBlocksPerCall() }
 
 func (f *flakyComp) CompressBlocks(ctx context.Context, plain BlockPlain, uSizes []int, dictSize int,
 	fn func(idx int, blk CompressedBlock) error) error {
@@ -510,7 +509,7 @@ func (f *flakyComp) CompressBlocks(ctx context.Context, plain BlockPlain, uSizes
 		offs[i] = at
 		at += u
 	}
-	return f.inner.CompressBlocks(ctx, plain, uSizes, dictSize, func(idx int, blk CompressedBlock) error {
+	return f.Compressor.CompressBlocks(ctx, plain, uSizes, dictSize, func(idx int, blk CompressedBlock) error {
 		if dictSize != f.metaDict && !blk.Raw && len(blk.OnDisk) > 8 {
 			// Reading the block's plaintext back may reuse the buffer the inner
 			// compressor read it into, which is safe here only because this
@@ -542,7 +541,7 @@ func TestBlockPlanGateRefusesUnverifiableDelta(t *testing.T) {
 	source, target := churnPair(t)
 	delta := filepath.Join(t.TempDir(), "unverifiable.delta")
 
-	comp := &flakyComp{inner: &xzCLI{}, metaDict: squashfsMetadataSize}
+	comp := &flakyComp{Compressor: &xzCLI{}, metaDict: squashfsMetadataSize}
 	if _, err := generateBlockPlan(ctx, source, target, delta, blockPlanGenOpts{
 		Comp: comp, Verify: true,
 	}); err == nil {
@@ -557,7 +556,7 @@ func TestBlockPlanGateRefusesUnverifiableDelta(t *testing.T) {
 
 	// Without the gate the same generation succeeds, which is what makes the
 	// gate rather than the verification the thing under test here.
-	comp2 := &flakyComp{inner: &xzCLI{}, metaDict: squashfsMetadataSize}
+	comp2 := &flakyComp{Compressor: &xzCLI{}, metaDict: squashfsMetadataSize}
 	if _, err := generateBlockPlan(ctx, source, target, delta, blockPlanGenOpts{Comp: comp2}); err != nil {
 		t.Fatalf("generating without the gate: %v", err)
 	}

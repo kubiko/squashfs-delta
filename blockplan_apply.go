@@ -90,8 +90,14 @@ type applyStats struct {
 
 // blockPlanApplyOpts carries what the apply needs beyond the three streams.
 type blockPlanApplyOpts struct {
-	// Comp compresses recompressed blocks. Required.
+	// Comp overrides the compressor. Nil is the normal case and derives it from
+	// the target superblock the delta carries in SEC_SB, so a device is never
+	// told what compressed the image it is assembling; a non-nil one must agree
+	// with that superblock.
 	Comp Compressor
+	// Threads is a hint for the derived compressor, ignored by the in-process
+	// ones. Zero lets it decide.
+	Threads int
 	// HpatchzPath is the patch tool binary; empty means look it up.
 	HpatchzPath string
 	// MaxRunUSize is the largest patch run this applier is willing to accept.
@@ -125,9 +131,6 @@ type applyState struct {
 // applyBlockPlan reconstructs the target image from source and delta, writing it
 // to out. src must be the exact source revision the delta was generated against.
 func applyBlockPlan(ctx context.Context, src *os.File, delta io.Reader, out io.Writer, opts blockPlanApplyOpts) (*applyStats, error) {
-	if opts.Comp == nil {
-		return nil, fmt.Errorf("no compressor configured")
-	}
 	br, err := openBlockPlan(delta)
 	if err != nil {
 		return nil, err
@@ -179,14 +182,25 @@ func applyBlockPlan(ctx context.Context, src *os.File, delta io.Reader, out io.W
 	if tsb.BlockSize != h.BlockSize {
 		return nil, fmt.Errorf("SEC_SB block size %d disagrees with the delta header's %d", tsb.BlockSize, h.BlockSize)
 	}
+	// The compressor comes from the image the delta describes, so a device needs
+	// no configuration to apply one -- and an image whose compressor this build
+	// cannot reproduce byte for byte is refused here, before the target is
+	// touched. An override is honoured only if it agrees with SEC_SB.
+	if opts.Comp == nil {
+		if opts.Comp, err = newCompressor(tsb.CompressionId, opts.Threads); err != nil {
+			return nil, err
+		}
+	} else if err := checkCompressorMatches(opts.Comp, tsb.CompressionId); err != nil {
+		return nil, err
+	}
 
 	st := &applyState{br: br, src: src, opts: opts, blockSize: int(h.BlockSize)}
 	st.pay = newCRCReader(br.pay, br.payLen, br.payCRC)
 
 	// The source's own metadata region feeds both the metadata patch and the
-	// canary, so decode it up front: ~200 KB of xz, and any failure lands
+	// canary, so decode it up front: ~200 KB of it, and any failure lands
 	// before the target has been touched.
-	srcMeta, err := readSourceMetaBlob(ctx, src, fi.Size())
+	srcMeta, err := readSourceMetaBlob(ctx, src, fi.Size(), opts.Comp)
 	if err != nil {
 		return nil, fmt.Errorf("source metadata: %w", err)
 	}
@@ -274,7 +288,8 @@ func applyBlockPlan(ctx context.Context, src *os.File, delta io.Reader, out io.W
 func (st *applyState) applyInstructions(ctx context.Context) error {
 	h := st.br.Header
 	instr := st.br.section(secInstr)
-	d := newInstrDecoder(instr, st.blockSize, int64(h.SourceSize), int64(h.MaxRunUSize))
+	d := newInstrDecoder(instr, st.blockSize, int64(h.SourceSize), int64(h.MaxRunUSize),
+		st.opts.Comp.NeedsBlockSizes())
 
 	var in Instruction
 	for i := uint32(0); i < h.InstrCount; i++ {
@@ -331,16 +346,17 @@ func (st *applyState) applyPatchRun(ctx context.Context, in *Instruction) error 
 	// Three files rather than three heap buffers, because these are the largest
 	// things an apply handles: the run's plaintext, which MaxRunUSize caps, and
 	// the source window it is rebuilt from, which is a multiple of that again.
-	// The window streams from the source through `xz -dc` straight into the file
-	// hpatchz reads, hpatchz writes the plaintext into a file of its own, and the
-	// compressor reads that one block at a time -- so a 12 MiB window and an
-	// 8 MiB run cost this process a pipe buffer and one block, not 20 MiB.
+	// The window streams from the source through the decompressor straight into
+	// the file hpatchz reads, hpatchz writes the plaintext into a file of its
+	// own, and the compressor reads that one block at a time -- so a 12 MiB
+	// window and an 8 MiB run cost this process a pipe buffer and one block, not
+	// 20 MiB.
 	oldFD, err := NewReusableMemFD("old")
 	if err != nil {
 		return err
 	}
 	defer oldFD.Close()
-	nWin, err := gatherWindowsTo(ctx, st.src, in.Windows, oldFD.File)
+	nWin, err := gatherWindowsTo(ctx, st.src, in.Windows, oldFD.File, st.opts.Comp, st.blockSize)
 	if err != nil {
 		return err
 	}
@@ -400,12 +416,12 @@ func (st *applyState) applyPatchRun(ctx context.Context, in *Instruction) error 
 // what the generator diffed against.
 //
 // This is the only decompression the applier does over the data region, and it is
-// the format's second economy after OP_COPY: xz decompression runs roughly an
+// the format's second economy after OP_COPY: decompression runs roughly an
 // order of magnitude faster than compression, so reading back the little source
 // plaintext a changed run needs costs far less than the whole-image decompress the
 // pseudo-file formats do -- and unlike them, it is never followed by recompressing
 // bytes that did not change.
-func gatherWindowsTo(ctx context.Context, src *os.File, windows []SrcWindow, dst io.Writer) (int64, error) {
+func gatherWindowsTo(ctx context.Context, src *os.File, windows []SrcWindow, dst io.Writer, dec Decompressor, blockSize int) (int64, error) {
 	var total int64
 	for _, win := range windows {
 		// The compressed window streams out of the source rather than being read
@@ -425,11 +441,11 @@ func gatherWindowsTo(ctx context.Context, src *os.File, windows []SrcWindow, dst
 			total += n
 			continue
 		}
-		// One process for the whole window: the blocks in it are consecutive
-		// complete xz streams, and concatenated streams decode in a single pass.
-		// The declared plaintext length is enforced, so a window that does not
-		// decompress to exactly ULen is rejected here.
-		n, err := xzDecompressTo(ctx, dst, stored, win.ULen)
+		// One call for the whole window rather than one per block, which for xz
+		// is one process for however many blocks it spans. The declared
+		// plaintext length is enforced, so a window that does not decompress to
+		// exactly ULen is rejected here.
+		n, err := dec.DecompressTo(ctx, dst, stored, win.CSizes, blockSize, win.ULen)
 		if err != nil {
 			return total, fmt.Errorf("decompressing source window [%d,+%d): %w", win.Off, win.Len, err)
 		}
@@ -444,7 +460,12 @@ func gatherWindowsTo(ctx context.Context, src *os.File, windows []SrcWindow, dst
 // place the applier looks inside the source image, and it reads nothing but the
 // superblock's table pointers and the two-byte metadata block headers -- no
 // inodes, no directories, no block size words.
-func readSourceMetaBlob(ctx context.Context, src *os.File, size int64) ([]byte, error) {
+//
+// comp is the compressor the delta describes the target with, and the source has
+// to have been built by the same one: every OP_COPY moves source bytes into the
+// target unchanged, so a source compressed differently would put blocks in the
+// image that its own superblock contradicts.
+func readSourceMetaBlob(ctx context.Context, src *os.File, size int64, comp Compressor) ([]byte, error) {
 	head := make([]byte, 96)
 	if _, err := src.ReadAt(head, 0); err != nil {
 		return nil, err
@@ -456,13 +477,17 @@ func readSourceMetaBlob(ctx context.Context, src *os.File, size int64) ([]byte, 
 	if err := sb.checkSupportedGeometry(size); err != nil {
 		return nil, err
 	}
+	if sb.CompressionId != comp.ID() {
+		return nil, fmt.Errorf("source was built with %s, the delta describes a %s image",
+			compressorName(sb.CompressionId), compressorName(comp.ID()))
+	}
 	start, end := int64(sb.InodeTableStart), int64(sb.ExportTableStart)
 	region := make([]byte, end-start)
 	if _, err := src.ReadAt(region, start); err != nil {
 		return nil, err
 	}
 	// walkMetaRegion works over an image view, so present the region as one.
-	view := &SquashfsImage{Path: src.Name(), Data: region, SB: sb}
+	view := &SquashfsImage{Path: src.Name(), Data: region, SB: sb, Dec: comp}
 	reg, err := view.walkMetaRegion(ctx, 0, int64(len(region)))
 	if err != nil {
 		return nil, err

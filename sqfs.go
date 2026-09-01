@@ -190,6 +190,10 @@ type SquashfsImage struct {
 	Path string
 	Data []byte
 	SB   *SquashfsHeader
+	// Dec decompresses this image's blocks. It comes from the superblock's own
+	// compressor id, so nothing that reads an image has to be told, or has to
+	// guess, what compressed it.
+	Dec Decompressor
 }
 
 func openSquashfsImage(path string) (*SquashfsImage, error) {
@@ -201,7 +205,24 @@ func openSquashfsImage(path string) (*SquashfsImage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return &SquashfsImage{Path: path, Data: data, SB: sb}, nil
+	return newSquashfsView(path, data, sb)
+}
+
+// newSquashfsView wraps bytes that have already been read as an image, which is
+// what the applier does with the source's metadata region: it holds that region
+// alone and presents it as an image so the same walk serves both sides.
+//
+// The compressor is built here rather than lazily so an image whose compressor
+// this build cannot reproduce is refused at the point it is opened, before any
+// caller can start work that would have to be undone.
+func newSquashfsView(path string, data []byte, sb *SquashfsHeader) (*SquashfsImage, error) {
+	// Decompression only, so no thread hint: the compression side builds its
+	// own compressor with whatever the caller asked for.
+	comp, err := newCompressor(sb.CompressionId, 0)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return &SquashfsImage{Path: path, Data: data, SB: sb, Dec: comp}, nil
 }
 
 // Size is the image length in bytes.
@@ -260,8 +281,9 @@ func (sb *SquashfsHeader) checkSupportedGeometry(imageSize int64) error {
 	switch {
 	case sb.MajorVersion != 4 || sb.MinorVersion != 0:
 		return fmt.Errorf("unsupported squashfs version %d.%d", sb.MajorVersion, sb.MinorVersion)
-	case sb.CompressionId != compressorXz:
-		return fmt.Errorf("unsupported compressor id %d, only xz (%d) is implemented", sb.CompressionId, compressorXz)
+	case !compressorImplemented(sb.CompressionId):
+		return fmt.Errorf("unsupported compressor %s, this build implements %s",
+			compressorName(sb.CompressionId), implementedCompressors())
 	case sb.Flags&flagCompressorOptions != 0:
 		return fmt.Errorf("image carries COMPRESSOR_OPTIONS, whose filter chain is not reproduced")
 	case sb.FragmentEntryCnt != 0:
@@ -287,8 +309,13 @@ func (sb *SquashfsHeader) checkSupportedGeometry(imageSize int64) error {
 	if sb.BlockSize != 1<<sb.BlockLog {
 		return fmt.Errorf("block size %d disagrees with block log %d", sb.BlockSize, sb.BlockLog)
 	}
-	if _, err := dictProp(int(sb.BlockSize)); err != nil {
-		return fmt.Errorf("block size %d cannot be an LZMA2 dictionary size: %w", sb.BlockSize, err)
+	// An xz block's dictionary size is its block size, and it has to be one
+	// LZMA2 can name, because the container this format synthesizes encodes it
+	// as a single property byte. No other compressor has a dictionary at all.
+	if sb.CompressionId == compressorXz {
+		if _, err := dictProp(int(sb.BlockSize)); err != nil {
+			return fmt.Errorf("block size %d cannot be an LZMA2 dictionary size: %w", sb.BlockSize, err)
+		}
 	}
 	if sb.BytesUsed > uint64(imageSize) {
 		return fmt.Errorf("superblock claims %d bytes used but the file is %d", sb.BytesUsed, imageSize)
@@ -329,13 +356,9 @@ func (im *SquashfsImage) readMetaBlock(ctx context.Context, off int64) (content 
 	if raw {
 		return payload, 2 + cSize, true, nil
 	}
-	out, err := xzDecompressAll(ctx, payload, -1)
+	out, _, err := im.Dec.DecompressBlocks(ctx, nil, payload, []int{cSize}, squashfsMetadataSize)
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("metadata block at %d: %w", off, err)
-	}
-	if len(out) > squashfsMetadataSize {
-		return nil, 0, false, fmt.Errorf("metadata block at %d expands to %d bytes, over the %d limit",
-			off, len(out), squashfsMetadataSize)
 	}
 	return out, 2 + cSize, false, nil
 }
@@ -361,14 +384,18 @@ func (im *SquashfsImage) walkMetaRegion(ctx context.Context, start, end int64) (
 	if start > end {
 		return nil, fmt.Errorf("metadata region [%d,%d) is inverted", start, end)
 	}
-	// One xz process for the whole region: each block payload is a complete
-	// stream and xz decodes concatenated streams in a single pass.
+	// The whole region in one call: for xz that is a single process over the
+	// concatenated streams, and for an in-process compressor a loop that costs
+	// nothing extra. The raw blocks are spliced back in afterwards.
 	type slot struct {
-		blk    MetaBlock
-		stream []byte
+		blk MetaBlock
+		// compressed reports that this block contributed to streams, and so
+		// takes the next of the plaintext lengths the decompressor reports.
+		compressed bool
 	}
 	var slots []slot
 	var streams []byte
+	var cSizes []int
 	for off := start; off < end; {
 		if off+2 > end {
 			return nil, fmt.Errorf("metadata block header at %d crosses the region end %d", off, end)
@@ -384,8 +411,9 @@ func (im *SquashfsImage) walkMetaRegion(ctx context.Context, start, end int64) (
 		if raw {
 			s.blk.USize = cSize
 		} else {
-			s.stream = payload
+			s.compressed = true
 			streams = append(streams, payload...)
+			cSizes = append(cSizes, cSize)
 		}
 		slots = append(slots, s)
 		off += 2 + int64(cSize)
@@ -397,17 +425,25 @@ func (im *SquashfsImage) walkMetaRegion(ctx context.Context, start, end int64) (
 		}
 	}
 
+	// A metadata block's uncompressed size is recorded nowhere in the image, so
+	// it comes back from the decompressor alongside the plaintext: the split
+	// points are the one thing the walk cannot derive from the image itself.
 	var plain []byte
-	if len(streams) > 0 {
+	var uSizes []int
+	if len(cSizes) > 0 {
 		var err error
-		plain, err = xzDecompressAll(ctx, streams, -1)
+		plain, uSizes, err = im.Dec.DecompressBlocks(ctx, nil, streams, cSizes, squashfsMetadataSize)
 		if err != nil {
 			return nil, fmt.Errorf("metadata region [%d,%d): %w", start, end, err)
+		}
+		if len(uSizes) != len(cSizes) {
+			return nil, fmt.Errorf("metadata region [%d,%d): decompressor reported %d sizes for %d blocks",
+				start, end, len(uSizes), len(cSizes))
 		}
 	}
 
 	reg := &MetaRegion{Start: start, index: make(map[uint64]int, len(slots))}
-	pos := 0
+	pos, next := 0, 0
 	for i := range slots {
 		s := &slots[i]
 		reg.index[uint64(s.blk.Offset-start)] = len(reg.Blob)
@@ -416,21 +452,11 @@ func (im *SquashfsImage) walkMetaRegion(ctx context.Context, start, end int64) (
 			reg.Blocks = append(reg.Blocks, s.blk)
 			continue
 		}
-		// Blocks are 8192 bytes uncompressed except the last, so the split
-		// point is unknown until the payload is decoded -- but xz's own
-		// stream boundaries give it away only in aggregate. Decode each
-		// block's declared length from its stream index instead.
-		n, err := xzStreamUncompressedSize(s.stream)
-		if err != nil {
-			return nil, fmt.Errorf("metadata block at %d: %w", s.blk.Offset, err)
-		}
+		n := uSizes[next]
+		next++
 		if pos+n > len(plain) {
 			return nil, fmt.Errorf("metadata block at %d claims %d bytes but only %d remain",
 				s.blk.Offset, n, len(plain)-pos)
-		}
-		if n > squashfsMetadataSize {
-			return nil, fmt.Errorf("metadata block at %d expands to %d bytes, over the %d limit",
-				s.blk.Offset, n, squashfsMetadataSize)
 		}
 		s.blk.USize = n
 		reg.Blob = append(reg.Blob, plain[pos:pos+n]...)
@@ -441,31 +467,6 @@ func (im *SquashfsImage) walkMetaRegion(ctx context.Context, start, end int64) (
 		return nil, fmt.Errorf("metadata region [%d,%d): consumed %d of %d decompressed bytes", start, end, pos, len(plain))
 	}
 	return reg, nil
-}
-
-// xzStreamUncompressedSize reads the uncompressed size out of the first block
-// header of an .xz stream, which the buffer encoder always records.
-func xzStreamUncompressedSize(stream []byte) (int, error) {
-	if len(stream) < 14 {
-		return 0, fmt.Errorf("stream too short to hold a block header")
-	}
-	hdr := stream[12:]
-	flags := hdr[1]
-	pos := 2
-	if flags&blockHeaderFlagCompressedSize != 0 {
-		var err error
-		if _, pos, err = readVLI(hdr, pos); err != nil {
-			return 0, err
-		}
-	}
-	if flags&blockHeaderFlagUncompressedSize == 0 {
-		return 0, fmt.Errorf("block header omits the uncompressed size (flags %#02x)", flags)
-	}
-	n, _, err := readVLI(hdr, pos)
-	if err != nil {
-		return 0, err
-	}
-	return int(n), nil
 }
 
 // --- inodes ---
@@ -720,59 +721,86 @@ func (im *SquashfsImage) CheckCoverage(ctx context.Context) (ext []Extent, gaps,
 
 // DecompressExtent returns an extent's uncompressed contents.
 func (im *SquashfsImage) DecompressExtent(ctx context.Context, e Extent) ([]byte, error) {
-	if e.Offset < 0 || e.Offset+int64(e.CSize) > int64(len(im.Data)) {
-		return nil, fmt.Errorf("extent at %d (%d bytes) is out of range", e.Offset, e.CSize)
-	}
-	blob := im.Data[e.Offset : e.Offset+int64(e.CSize)]
 	if e.Raw {
-		return blob, nil
+		if e.Offset < 0 || e.Offset+int64(e.CSize) > int64(len(im.Data)) {
+			return nil, fmt.Errorf("extent at %d (%d bytes) is out of range", e.Offset, e.CSize)
+		}
+		return im.Data[e.Offset : e.Offset+int64(e.CSize)], nil
 	}
-	return xzDecompressAll(ctx, blob, e.USize)
+	return im.decompressExtentRun(ctx, nil, []Extent{e})
 }
 
-// DecompressExtents returns the concatenated contents of a run of extents,
-// costing one xz process for the whole run rather than one per block.
+// decompressExtentRun appends the plaintext of consecutive compressed extents to
+// dst, in one call to the decompressor rather than one per block -- which for
+// the process-based compressor is the difference between one xz and one per
+// block.
+//
+// Each extent's uncompressed size is checked against what came out. The inode
+// is where that number is read from and the compressed data is where it is
+// proven, so a disagreement means the extent was misplaced, and reusing it
+// verbatim would put the wrong bytes in the target.
+func (im *SquashfsImage) decompressExtentRun(ctx context.Context, dst []byte, ext []Extent) ([]byte, error) {
+	cSizes := make([]int, len(ext))
+	cTotal, uTotal := 0, 0
+	for i, e := range ext {
+		if e.Offset < 0 || e.Offset+int64(e.CSize) > int64(len(im.Data)) {
+			return nil, fmt.Errorf("extent at %d (%d bytes) is out of range", e.Offset, e.CSize)
+		}
+		cSizes[i] = e.CSize
+		cTotal += e.CSize
+		uTotal += e.USize
+	}
+	streams := make([]byte, 0, cTotal)
+	for _, e := range ext {
+		streams = append(streams, im.Data[e.Offset:e.Offset+int64(e.CSize)]...)
+	}
+	before := len(dst)
+	out, uSizes, err := im.Dec.DecompressBlocks(ctx, dst, streams, cSizes, int(im.SB.BlockSize))
+	if err != nil {
+		return nil, err
+	}
+	if len(uSizes) != len(ext) {
+		return nil, fmt.Errorf("decompressor reported %d sizes for %d extents", len(uSizes), len(ext))
+	}
+	for i, e := range ext {
+		if uSizes[i] != e.USize {
+			return nil, fmt.Errorf("extent at %d expands to %d bytes, the inode says %d",
+				e.Offset, uSizes[i], e.USize)
+		}
+	}
+	if len(out)-before != uTotal {
+		return nil, fmt.Errorf("run of %d extents expands to %d bytes, expected %d",
+			len(ext), len(out)-before, uTotal)
+	}
+	return out, nil
+}
+
+// DecompressExtents returns the concatenated contents of a run of extents.
 func (im *SquashfsImage) DecompressExtents(ctx context.Context, ext []Extent) ([]byte, error) {
-	var streams []byte
-	uTotal, cTotal := 0, 0
-	allCompressed := true
+	uTotal := 0
 	for _, e := range ext {
 		uTotal += e.USize
-		cTotal += e.CSize
-		if e.Raw {
-			allCompressed = false
-		}
 	}
-	if allCompressed {
-		streams = make([]byte, 0, cTotal)
-		for _, e := range ext {
-			if e.Offset+int64(e.CSize) > int64(len(im.Data)) {
-				return nil, fmt.Errorf("extent at %d (%d bytes) is out of range", e.Offset, e.CSize)
-			}
-			streams = append(streams, im.Data[e.Offset:e.Offset+int64(e.CSize)]...)
-		}
-		return xzDecompressAll(ctx, streams, uTotal)
-	}
-	// Mixed run: decode the compressed prefix runs in batches and splice the
-	// raw blocks in place.
+	// Decode each maximal compressed run in one call and splice the raw blocks
+	// in place. A raw block's bytes are its plaintext, so it never reaches the
+	// decompressor.
 	out := make([]byte, 0, uTotal)
 	for i := 0; i < len(ext); {
 		if ext[i].Raw {
+			if ext[i].Offset < 0 || ext[i].Offset+int64(ext[i].CSize) > int64(len(im.Data)) {
+				return nil, fmt.Errorf("extent at %d (%d bytes) is out of range", ext[i].Offset, ext[i].CSize)
+			}
 			out = append(out, im.Data[ext[i].Offset:ext[i].Offset+int64(ext[i].CSize)]...)
 			i++
 			continue
 		}
-		j, want := i, 0
-		var batch []byte
+		j := i
 		for ; j < len(ext) && !ext[j].Raw; j++ {
-			batch = append(batch, im.Data[ext[j].Offset:ext[j].Offset+int64(ext[j].CSize)]...)
-			want += ext[j].USize
 		}
-		plain, err := xzDecompressAll(ctx, batch, want)
-		if err != nil {
+		var err error
+		if out, err = im.decompressExtentRun(ctx, out, ext[i:j]); err != nil {
 			return nil, err
 		}
-		out = append(out, plain...)
 		i = j
 	}
 	return out, nil

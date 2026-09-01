@@ -68,13 +68,20 @@ func (r selftestResult) clean() bool {
 
 // runSelftest recompresses up to sample data blocks (all of them when sample is
 // zero) and every compressible metadata block, comparing against the image.
-func runSelftest(ctx context.Context, path string, sample int, comp Compressor) (*selftestResult, error) {
+func runSelftest(ctx context.Context, path string, sample, threads int) (*selftestResult, error) {
 	t0 := time.Now()
 	im, err := openSquashfsImage(path)
 	if err != nil {
 		return nil, err
 	}
 	if err := im.checkSupported(); err != nil {
+		return nil, err
+	}
+	// Per image rather than once for the run: this command is pointed at a
+	// directory of snaps, and the whole question it answers is whether each
+	// image's own compressor can be reproduced.
+	comp, err := newCompressor(im.SB.CompressionId, threads)
+	if err != nil {
 		return nil, err
 	}
 	r := &selftestResult{Path: path}
@@ -303,14 +310,13 @@ func cmdInspect(ctx context.Context, paths []string) error {
 // cmdSelftest runs the recompression gate over each image and prints one line
 // per image plus a tally, failing if any image is not clean.
 func cmdSelftest(ctx context.Context, paths []string, sample, threads int) error {
-	comp := &xzCLI{threads: threads}
 	hdr := fmt.Sprintf("%-44s%7s %6s %5s %5s %5s %12s %12s %6s %5s",
 		"image", "MB", "ext", "raw", "part", "gap/ov", "data", "meta", "acct", "time")
 	fmt.Println(hdr)
 	fmt.Println(strings.Repeat("-", len(hdr)))
 	bad := 0
 	for _, p := range paths {
-		r, err := runSelftest(ctx, p, sample, comp)
+		r, err := runSelftest(ctx, p, sample, threads)
 		if err != nil {
 			fmt.Printf("%-44s ERROR %v\n", trimName(p), err)
 			bad++
