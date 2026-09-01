@@ -552,3 +552,137 @@ func TestBlockPlanGateRefusesUnverifiableDelta(t *testing.T) {
 		t.Errorf("an ungated delta was not written: %v", err)
 	}
 }
+
+// TestSrcWindowsSpanRawBoundaries covers what a window may not do: stop.
+//
+// A window holds blocks of one kind, because the applier decompresses it in one
+// pass, so a run of raw blocks inside an otherwise compressed region ends one.
+// Ending the whole budget there starves the patch -- measured on imx-kernel,
+// where a FIT image's raw stretches cut three 8 MiB runs down to windows of
+// 917 KiB, 1.5 MiB and 655 KiB and cost 18.5 MiB of patch. windowsFrom must
+// instead continue into a fresh window and keep spending the budget.
+func TestSrcWindowsSpanRawBoundaries(t *testing.T) {
+	requireTools(t, "mksquashfs", "xz")
+	ctx := context.Background()
+	// populateMixed holds both compressed blocks and a raw one, so at least one
+	// boundary exists to be crossed.
+	im, err := openSquashfsImage(buildImage(t, "segments.snap", populateMixed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ext, _, _, err := im.CheckCoverage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pick := newSrcWindowPicker(im, ext)
+
+	wins, ok := pick.windowsFrom(ext[0].Offset, 1<<30)
+	if !ok {
+		t.Fatal("no windows at the start of the data region")
+	}
+	if len(wins) < 2 {
+		t.Fatalf("the fixture produced %d window(s), so no raw boundary was crossed", len(wins))
+	}
+	// With a budget past the region's size the windows must together be the whole
+	// region: same extents, in order, nothing dropped at a boundary.
+	var got []Extent
+	at := ext[0].Offset
+	for i, w := range wins {
+		if w.Off != at {
+			t.Errorf("window %d starts at %d, leaving a hole after %d", i, w.Off, at)
+		}
+		in := pick.extentsIn(w)
+		for _, e := range in {
+			if e.Raw != in[0].Raw {
+				t.Errorf("window %d mixes raw and compressed blocks", i)
+			}
+		}
+		if w.Plain() != in[0].Raw {
+			t.Errorf("window %d reports Plain()=%v over raw=%v blocks", i, w.Plain(), in[0].Raw)
+		}
+		got = append(got, in...)
+		at = w.Off + int64(w.Len)
+	}
+	if len(got) != len(ext) {
+		t.Fatalf("the windows span %d of the region's %d blocks", len(got), len(ext))
+	}
+	for i := range got {
+		if got[i] != ext[i] {
+			t.Fatalf("window block %d is %+v, want %+v", i, got[i], ext[i])
+		}
+	}
+	// The plaintext the applier holds at once is the total across windows, so
+	// that is what the budget bounds -- give or take the first block, which is
+	// indivisible.
+	const budget = 200000
+	wins, ok = pick.windowsFrom(ext[0].Offset, budget)
+	if !ok {
+		t.Fatal("no windows within a bounded budget")
+	}
+	u := 0
+	for _, w := range wins {
+		u += w.ULen
+	}
+	if u > budget+ext[0].USize {
+		t.Errorf("windows hold %d bytes of plaintext against a %d budget", u, budget)
+	}
+	if u >= ext[0].USize+ext[1].USize+ext[2].USize+ext[3].USize+ext[4].USize {
+		// Not a correctness bound, just a check that the budget bites at all --
+		// otherwise the assertion above passes vacuously.
+		t.Errorf("a %d-byte budget yielded %d bytes of plaintext, so it was not enforced", budget, u)
+	}
+}
+
+// TestPatchRunCrossesRawStretch is the same defect end to end: one run whose
+// plaintext spans a stretch the source stores raw. Every block of the file
+// changes a little, as a rebuilt binary's do, so the run covers the whole file --
+// compressible head, incompressible middle, compressible tail -- and a window
+// that stops at the head/middle boundary has nothing to offer the rest of it.
+func TestPatchRunCrossesRawStretch(t *testing.T) {
+	requireTools(t, "mksquashfs", "xz", "hdiffz", "hpatchz")
+	ctx := context.Background()
+
+	// The middle is what mksquashfs stores raw and what the window has to get
+	// past; the head and tail are compressible, so they are stored as xz streams
+	// and cannot share a window with it.
+	const part = 1 << 20
+	body := append(append(append([]byte{},
+		compressibleText(part, "head")...),
+		incompressible(part, 9)...),
+		semiCompressible(part, 3)...)
+	// Flip one byte every 4 KiB, which leaves every block of the target
+	// different from the source's and so puts the whole file in one run, while
+	// leaving it almost entirely matchable.
+	edited := append([]byte{}, body...)
+	for i := 0; i < len(edited); i += 4 << 10 {
+		edited[i] ^= 0x40
+	}
+	source := buildImage(t, "raw-source.snap", func(t *testing.T, dir string) {
+		writeFile(t, dir, "data/blob.bin", body)
+	})
+	target := buildImage(t, "raw-target.snap", func(t *testing.T, dir string) {
+		writeFile(t, dir, "data/blob.bin", edited)
+	})
+
+	stats, err := generateBlockPlan(ctx, source, target, filepath.Join(t.TempDir(), "raw.delta"),
+		blockPlanGenOpts{Comp: &xzCLI{}, Verify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.PatchRuns == 0 {
+		t.Fatalf("no run was patched (%d no window, %d not worth it, %d failed verify)",
+			stats.RunsNoWindow, stats.RunsTooExpensive, stats.RunsVerifyFailed)
+	}
+	if stats.LiteralBytes != 0 {
+		t.Errorf("%d bytes shipped as literals, so a run did not get the window it needed",
+			stats.LiteralBytes)
+	}
+	// The edit is 1 byte in 4096 against a source that holds all of it, so the
+	// patch is a list of small changes. A window truncated at the raw stretch
+	// instead leaves two thirds of the run diffed against nothing, and the patch
+	// carries that plaintext itself -- hundreds of KiB, not tens.
+	if stats.PatchBytes > 256<<10 {
+		t.Errorf("patching a run across a raw stretch cost %d bytes, and the run only "+
+			"reconstructs %d bytes of plaintext", stats.PatchBytes, stats.PatchedUBytes)
+	}
+}

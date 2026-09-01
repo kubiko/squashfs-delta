@@ -113,8 +113,8 @@ func defaultPatchRunTuning(maxRunUSize int) patchRunTuning {
 	}
 }
 
-// srcWindowPicker turns a byte range of the source data region into a window of
-// whole source blocks the applier can decompress in one pass.
+// srcWindowPicker turns a byte range of the source data region into the windows
+// of whole source blocks the applier decompresses to feed a patch run.
 type srcWindowPicker struct {
 	src *SquashfsImage
 	// ext is every source block, sorted by offset and tiling the data region
@@ -126,51 +126,80 @@ func newSrcWindowPicker(src *SquashfsImage, ext []Extent) *srcWindowPicker {
 	return &srcWindowPicker{src: src, ext: ext}
 }
 
-// window returns a window of source blocks starting at or after lo, holding at
-// most maxU bytes of plaintext.
+// windowsFrom returns windows covering at most maxU bytes of source plaintext,
+// starting at the first whole block at or after lo.
 //
-// Two constraints come from the applier's side of the contract. The window must
+// Two constraints come from the applier's side of the contract. A window must
 // consist of whole blocks, because it is decompressed as a unit; and every block
-// in it must agree on being compressed or being raw, because a single `xz -dc`
-// cannot walk past a block that is not an xz stream. Raw blocks are the minority
-// (about 7% of blocks in a snap), so in practice they just end a window early.
-func (p *srcWindowPicker) window(lo int64, maxU int) (SrcWindow, bool) {
+// in one must agree on being compressed or being raw, because a single `xz -dc`
+// cannot walk past a block that is not an xz stream. That second constraint is
+// why this returns a list: a window ends where the source stops being uniformly
+// one or the other, and the next one picks up immediately after. The applier
+// decompresses them in order into a single buffer, so a split costs a handful of
+// instruction bytes and nothing else.
+//
+// Ending the whole window at the first such boundary instead -- which is what
+// this did until the kernel snap was measured -- looks harmless when raw blocks
+// are a scattered 7% of an image. It is not harmless when they come in runs:
+// imx-kernel's kernel.img is a FIT image holding already-compressed payloads, so
+// mksquashfs stores long stretches of it raw, and three runs there were handed
+// windows of 917 KiB, 1.5 MiB and 655 KiB for 8 MiB of plaintext each. Those
+// three alone cost 18.5 MiB of the pair's 20 MiB of patch.
+func (p *srcWindowPicker) windowsFrom(lo int64, maxU int) ([]SrcWindow, bool) {
 	if maxU <= 0 || len(p.ext) == 0 {
-		return SrcWindow{}, false
+		return nil, false
 	}
 	// The first block at or after lo. Landing mid-block rounds forward: a
 	// partial block cannot be decompressed.
 	i := sort.Search(len(p.ext), func(k int) bool { return p.ext[k].Offset >= lo })
 	if i == len(p.ext) {
-		return SrcWindow{}, false
+		return nil, false
 	}
-	first := p.ext[i]
-	w := SrcWindow{Off: first.Offset}
+	var out []SrcWindow
+	// cur is the window being built; -1 means there is none yet. uTotal is the
+	// plaintext across all of them, since maxU bounds what the applier holds at
+	// once and that is the sum, not any one window.
+	cur := -1
+	uTotal := 0
+	prevRaw := false
 	for ; i < len(p.ext); i++ {
 		e := p.ext[i]
-		if e.Raw != first.Raw {
+		if uTotal != 0 && uTotal+e.USize > maxU {
 			break
 		}
-		// Extents tile the region, so a discontinuity here means the run has
-		// ended -- which cannot happen on a verified image, but the check
-		// costs nothing and keeps the invariant local.
-		if w.Off+int64(w.Len) != e.Offset {
-			break
+		// A change of kind starts a new window. Extents tile the region, so a
+		// discontinuity cannot happen on a verified image, but it would mean the
+		// same thing, and the check costs nothing.
+		if cur >= 0 && (e.Raw != prevRaw || out[cur].Off+int64(out[cur].Len) != e.Offset) {
+			cur = -1
 		}
-		if w.ULen != 0 && w.ULen+e.USize > maxU {
-			break
+		if cur < 0 {
+			out = append(out, SrcWindow{Off: e.Offset})
+			cur = len(out) - 1
 		}
-		w.Len += e.CSize
-		w.ULen += e.USize
+		out[cur].Len += e.CSize
+		out[cur].ULen += e.USize
+		uTotal += e.USize
+		prevRaw = e.Raw
 	}
-	if w.Len == 0 {
-		return SrcWindow{}, false
+	if len(out) == 0 {
+		return nil, false
 	}
-	// A run of raw blocks satisfies ULen == Len -- the applier's "already
+	// A window of raw blocks satisfies ULen == Len -- the applier's "already
 	// plaintext" invariant -- for free: Extents refuses an image whose raw
 	// block occupies a different number of bytes than it holds, so every
 	// extent here already has CSize == USize when Raw.
-	return w, true
+	return out, true
+}
+
+// window returns the first of the windows at lo, which is what a caller that
+// only wants to know whether a window exists there is asking for.
+func (p *srcWindowPicker) window(lo int64, maxU int) (SrcWindow, bool) {
+	w, ok := p.windowsFrom(lo, maxU)
+	if !ok {
+		return SrcWindow{}, false
+	}
+	return w[0], true
 }
 
 // candidateRun is a span of consecutive unmatched target blocks, before the cost
@@ -253,12 +282,12 @@ func buildPatchRun(ctx context.Context, tgt *SquashfsImage, run *candidateRun, p
 		return nil, nil
 	}
 
-	win, ok := pick.window(run.srcAnchor, maxWinU)
+	wins, ok := pick.windowsFrom(run.srcAnchor, maxWinU)
 	kind := run.anchoredBy
 	if !ok && run.srcAnchor != run.srcFallback {
 		// The anchor sat past the last source block, which is what a file that
 		// lives near the end of the source looks like when the target grew.
-		win, ok = pick.window(run.srcFallback, maxWinU)
+		wins, ok = pick.windowsFrom(run.srcFallback, maxWinU)
 		kind = anchorNone
 	}
 	if !ok {
@@ -274,13 +303,23 @@ func buildPatchRun(ctx context.Context, tgt *SquashfsImage, run *candidateRun, p
 		stats.RunsCursorAnchored++
 	}
 
-	old, err := pick.src.DecompressExtents(ctx, pick.extentsIn(win))
-	if err != nil {
-		return nil, fmt.Errorf("decompressing the source window at %d: %w", win.Off, err)
+	// The windows are consecutive, so their extents concatenate, and
+	// DecompressExtents splices raw blocks into place exactly as the applier's
+	// gatherWindowsTo does window by window. One call therefore produces the
+	// same bytes the device will, which is what makes the patch valid.
+	var srcExt []Extent
+	winU := 0
+	for _, w := range wins {
+		srcExt = append(srcExt, pick.extentsIn(w)...)
+		winU += w.ULen
 	}
-	if len(old) != win.ULen {
-		return nil, fmt.Errorf("source window at %d decompressed to %d bytes, expected %d",
-			win.Off, len(old), win.ULen)
+	old, err := pick.src.DecompressExtents(ctx, srcExt)
+	if err != nil {
+		return nil, fmt.Errorf("decompressing the source window at %d: %w", wins[0].Off, err)
+	}
+	if len(old) != winU {
+		return nil, fmt.Errorf("source windows at %d decompressed to %d bytes, expected %d",
+			wins[0].Off, len(old), winU)
 	}
 	plain, err := tgt.DecompressExtents(ctx, run.ext)
 	if err != nil {
@@ -294,6 +333,11 @@ func buildPatchRun(ctx context.Context, tgt *SquashfsImage, run *candidateRun, p
 	patch, err := runHdiffz(ctx, old, plain, opts.HdiffzPath)
 	if err != nil {
 		return nil, fmt.Errorf("diffing a run of %d blocks: %w", len(run.ext), err)
+	}
+	if opts.RunLog != nil {
+		fmt.Fprintf(opts.RunLog, "run tgt=%d blocks=%d u=%d win=%d,%d,x%d patch=%d lit=%d anchor=%d,%s\n",
+			run.ext[0].Offset, len(run.ext), uTotal, wins[0].Off, winU, len(wins),
+			len(patch), literal, run.srcAnchor, kind)
 	}
 
 	// Now the real thing: if the patch does not beat the literals by enough,
@@ -336,7 +380,7 @@ func buildPatchRun(ctx context.Context, tgt *SquashfsImage, run *candidateRun, p
 		return nil, nil
 	}
 
-	return &builtRun{blocks: blocks, windows: []SrcWindow{win}, patch: patch}, nil
+	return &builtRun{blocks: blocks, windows: wins, patch: patch}, nil
 }
 
 // extentsIn returns the source blocks a window spans, which is what
