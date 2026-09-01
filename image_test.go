@@ -276,12 +276,6 @@ func TestImageRefusals(t *testing.T) {
 		// No export table means inodes cannot be enumerated without walking
 		// directories, which the generator deliberately does not do.
 		{name: "no exports", extra: []string{"-no-exports"}},
-		// An xattr table is not carried by the delta. Note it takes a file
-		// that really has an xattr: -xattrs on a tree without any produces a
-		// perfectly supportable image, which is exactly the core26 shape --
-		// NO_XATTRS clear, no xattr table -- and why the check gates on the
-		// table pointer rather than the flag.
-		{name: "xattrs", extra: []string{"-xattrs"}, populate: populateXattr},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -307,14 +301,73 @@ func TestImageRefusals(t *testing.T) {
 	}
 }
 
-// populateXattr is populateMixed plus one real extended attribute, which is what
-// makes mksquashfs emit an xattr table.
-func populateXattr(t *testing.T, dir string) {
+// populateXattr is populateMixed plus real extended attributes, which is what
+// makes mksquashfs emit an xattr table. Note it takes a file that really has
+// one: -xattrs on a tree without any produces an image with NO_XATTRS clear and
+// no xattr table at all, which is exactly the core26 shape and why the geometry
+// check gates on the table pointer rather than the flag.
+func populateXattr(t *testing.T, dir string, value string) {
 	t.Helper()
 	populateMixed(t, dir)
-	if err := syscall.Setxattr(filepath.Join(dir, "sub/small.txt"), "user.test", []byte("hello"), 0); err != nil {
-		t.Skipf("cannot set an xattr under %s: %v", dir, err)
+	for _, name := range []string{"sub/small.txt", "multi.txt"} {
+		if err := syscall.Setxattr(filepath.Join(dir, name), "user.test", []byte(value), 0); err != nil {
+			t.Skipf("cannot set an xattr under %s: %v", dir, err)
+		}
 	}
+}
+
+// TestImageXattrs pins down that an xattr table needs no work of its own. It
+// costs nothing because mksquashfs writes the xattr value blocks and id table
+// after every other table, so they land above export_table_start and travel
+// verbatim in SEC_MDTAIL -- and because the inode walk is driven by the export
+// table and both extended inode layouts carry their xattr word ahead of the
+// fields it reads. The test asserts the premise (the table really is up there),
+// not just the outcome, since the outcome would also hold if mksquashfs stopped
+// putting it there and the delta silently dropped it.
+func TestImageXattrs(t *testing.T) {
+	requireTools(t, "mksquashfs", "xz", "hdiffz", "hpatchz")
+	ctx := context.Background()
+
+	source := buildImage(t, "xattr-source.snap", func(t *testing.T, dir string) {
+		populateXattr(t, dir, "hello")
+	}, "-xattrs")
+	// The target's attributes differ in both name count and value length, so
+	// the xattr value blocks and id table both change and the tail section has
+	// to carry the new ones rather than the source's.
+	target := buildImage(t, "xattr-target.snap", func(t *testing.T, dir string) {
+		populateXattr(t, dir, "a rather longer value than the source had")
+		if err := syscall.Setxattr(filepath.Join(dir, "raw.bin"), "user.extra", []byte("2"), 0); err != nil {
+			t.Skipf("cannot set an xattr under %s: %v", dir, err)
+		}
+	}, "-xattrs")
+
+	for _, path := range []string{source, target} {
+		im, err := openSquashfsImage(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if im.SB.XattrTableStart == squashfsNoTable {
+			t.Fatalf("%s has no xattr table, so the fixture proves nothing", filepath.Base(path))
+		}
+		if err := im.checkSupported(); err != nil {
+			t.Fatalf("%s was refused: %v", filepath.Base(path), err)
+		}
+		// The value blocks are the lowest xattr byte, and the whole point is
+		// that they sit inside [export_table_start, bytes_used).
+		values := binary.LittleEndian.Uint64(im.Data[im.SB.XattrTableStart:])
+		if values < im.SB.ExportTableStart {
+			t.Errorf("%s puts its xattr value blocks at %d, below the export table at %d",
+				filepath.Base(path), values, im.SB.ExportTableStart)
+		}
+	}
+
+	delta := filepath.Join(t.TempDir(), "xattr.delta")
+	if _, err := generateBlockPlan(ctx, source, target, delta, blockPlanGenOpts{
+		Comp: &xzCLI{}, Verify: true,
+	}); err != nil {
+		t.Fatalf("generating a delta between images with xattrs: %v", err)
+	}
+	applyAndCompare(t, source, delta, target, &xzCLI{})
 }
 
 // TestImageNonDefaultBlockSize pins down what is *not* a refusal: a block size

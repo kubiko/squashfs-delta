@@ -217,10 +217,37 @@ func (im *SquashfsImage) checkSupported() error {
 	if err := im.SB.checkSupportedGeometry(im.Size()); err != nil {
 		return err
 	}
+	if err := im.checkXattrTail(); err != nil {
+		return err
+	}
 	for _, b := range im.Data[im.SB.BytesUsed:] {
 		if b != 0 {
 			return fmt.Errorf("trailing padding is not all zero")
 		}
+	}
+	return nil
+}
+
+// checkXattrTail confirms an image's xattr metadata really does lie inside the
+// region the delta ships verbatim, [export_table_start, bytes_used).
+//
+// The superblock's xattr pointer is the 16-byte squashfs_xattr_table header,
+// which generic_write_table writes *after* the id table's metadata blocks; the
+// value blocks it indexes sit lower still, at the offset in the header's first
+// field. So the lowest xattr byte is that field, not the superblock pointer, and
+// it is read here rather than assumed.
+func (im *SquashfsImage) checkXattrTail() error {
+	start := im.SB.XattrTableStart
+	if start == squashfsNoTable {
+		return nil
+	}
+	if start+16 > im.SB.BytesUsed {
+		return fmt.Errorf("xattr id table header at %d does not fit below bytes_used %d", start, im.SB.BytesUsed)
+	}
+	values := binary.LittleEndian.Uint64(im.Data[start:])
+	if values < im.SB.ExportTableStart || values >= im.SB.BytesUsed {
+		return fmt.Errorf("xattr value blocks start at %d, outside the verbatim tail [%d,%d)",
+			values, im.SB.ExportTableStart, im.SB.BytesUsed)
 	}
 	return nil
 }
@@ -243,10 +270,16 @@ func (sb *SquashfsHeader) checkSupportedGeometry(imageSize int64) error {
 	// FragTableStart is deliberately not checked, and never read: with no
 	// fragments it holds a stale write position, which on all 43 snaps swept
 	// points into the middle of the metadata region.
+	// Xattrs need no work of their own: mksquashfs writes their value blocks
+	// and id table last of all the tables, so they land above
+	// export_table_start and travel verbatim inside SEC_MDTAIL. All this rule
+	// has to enforce is that they really are up there -- checkXattrTail does
+	// the image-side half, following the header's pointer to the value blocks.
 	// Gate on the table pointer, never on the NO_XATTRS flag: core26 has
 	// that flag clear while carrying no xattr table at all.
-	if sb.XattrTableStart != squashfsNoTable {
-		return fmt.Errorf("image has an xattr table at %d, which is not reproduced", sb.XattrTableStart)
+	if sb.XattrTableStart != squashfsNoTable && sb.XattrTableStart < sb.ExportTableStart {
+		return fmt.Errorf("image has an xattr table at %d, below the export table at %d, so it is not carried verbatim",
+			sb.XattrTableStart, sb.ExportTableStart)
 	}
 	if sb.ExportTableStart == squashfsNoTable {
 		return fmt.Errorf("image has no export table, so inodes cannot be enumerated without walking directories")
