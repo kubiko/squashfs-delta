@@ -1893,7 +1893,7 @@ func main() {
 	// Setup subcommands
 	var genSource, genTarget, genDelta, appSource, appTarget, appDelta string
 	var xdelta3Tool, hdiffzTool, blocksFormat bool
-	var genThreads, genMaxRun int
+	var genThreads, genMaxRun, genMinSaving int
 	var genNoVerify, genNoPatchRuns, genNoPathMatch bool
 	var genWindowRatio, genMinSavingRate float64
 	var appReport bool
@@ -1911,12 +1911,13 @@ func main() {
 	generateCmd.IntVar(&genThreads, "threads", 0, "xz thread count, at least 2 (0 = default)")
 	generateCmd.IntVar(&genMaxRun, "max-run", 0, "cap on the plaintext one patch run reconstructs, which bounds apply memory (0 = default)")
 	generateCmd.BoolVar(&genNoVerify, "no-verify", false, "skip running the applier over the finished delta (--blocks only)")
-	// The last four drive the cost model from the command line, which is how its
+	// The last five drive the cost model from the command line, which is how its
 	// defaults were measured; nothing but a sweep should pass them.
 	generateCmd.BoolVar(&genNoPatchRuns, "no-patch-runs", false, "ship every changed block as a literal, asking the device for no data-block compression at all")
 	generateCmd.BoolVar(&genNoPathMatch, "no-path-match", false, "anchor patch runs by source offset alone, ignoring which file a block belongs to")
 	generateCmd.Float64Var(&genWindowRatio, "window-ratio", 0, "source window size as a multiple of a run's plaintext (0 = default)")
 	generateCmd.Float64Var(&genMinSavingRate, "min-saving-rate", 0, "delta bytes a run must save per byte of plaintext it makes the device compress (0 = default)")
+	generateCmd.IntVar(&genMinSaving, "min-saving", -1, "fewest delta bytes a run must save to be worth compressing for at all (-1 = default, 0 = no floor)")
 
 	applyCmd := flag.NewFlagSet("apply", flag.ExitOnError)
 	applyCmd.BoolVar(&appReport, "stats", false, "report what the apply cost")
@@ -1971,6 +1972,7 @@ func main() {
 				NoPathMatch:   genNoPathMatch,
 				WindowRatio:   genWindowRatio,
 				MinSavingRate: genMinSavingRate,
+				MinSaving:     genMinSaving,
 			})
 			break
 		}

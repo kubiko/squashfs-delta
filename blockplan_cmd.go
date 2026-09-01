@@ -133,9 +133,11 @@ type genCmdOpts struct {
 	NoPatchRuns bool
 	NoPathMatch bool
 	// WindowRatio and MinSavingRate override the cost model; zero leaves it at
-	// its default.
+	// its default. MinSaving is in bytes and negative leaves it alone, since
+	// zero is a meaningful setting there -- it removes the floor entirely.
 	WindowRatio   float64
 	MinSavingRate float64
+	MinSaving     int
 }
 
 // cmdGenerateBlocks generates a block-plan delta and reports its composition.
@@ -143,7 +145,7 @@ func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string
 	// The sweeps drive the cost model from the command line; everything else
 	// leaves it alone.
 	var tune *patchRunTuning
-	if o.WindowRatio > 0 || o.MinSavingRate != 0 {
+	if o.WindowRatio > 0 || o.MinSavingRate != 0 || o.MinSaving >= 0 {
 		t := defaultPatchRunTuning(o.MaxRun)
 		if o.WindowRatio > 0 {
 			t.WindowRatio = o.WindowRatio
@@ -151,11 +153,15 @@ func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string
 		if o.MinSavingRate != 0 {
 			t.MinSavingRate = max(o.MinSavingRate, 0)
 		}
+		if o.MinSaving >= 0 {
+			t.MinSaving = o.MinSaving
+		}
 		tune = &t
 	}
 	stats, err := generateBlockPlan(ctx, sourceSnap, targetSnap, delta, blockPlanGenOpts{
 		Comp:        &xzCLI{threads: o.Threads},
 		MaxRunUSize: o.MaxRun,
+
 		Verify:      o.Verify,
 		NoPatchRuns: o.NoPatchRuns,
 		NoPathMatch: o.NoPathMatch,
