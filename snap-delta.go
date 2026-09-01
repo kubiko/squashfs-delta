@@ -1498,6 +1498,7 @@ var (
 	toolXdelta3    = filepath.Join(snapdSnap, "/usr/bin/xdelta3")
 	toolHdiffz     = filepath.Join(toolboxSnap, "/usr/bin/hdiffz")
 	toolHpatchz    = filepath.Join(toolboxSnap, "/usr/bin/hpatchz")
+	toolXz         = filepath.Join(toolboxSnap, "/usr/bin/xz")
 )
 
 func getOptionForTool(tool string) string {
@@ -1512,6 +1513,8 @@ func getOptionForTool(tool string) string {
 		return "-v"
 	case "hpatchz":
 		return "-v"
+	case "xz":
+		return "--version"
 	default:
 		return ""
 	}
@@ -1531,6 +1534,8 @@ func getAlternativeToolPath(tool string) string {
 		return toolHdiffz
 	case "hpatchz":
 		return toolHpatchz
+	case "xz":
+		return toolXz
 	default:
 		return ""
 	}
@@ -1579,20 +1584,27 @@ type ReusableMemFD struct {
 // NewReusableMemFD creates a reusable file, preferring RAM but falling back to disk.
 func NewReusableMemFD(name string) (*ReusableMemFD, error) {
 	// create mem backed file
-	fd, err := unix.MemfdCreate(name, 0)
-	if err != nil {
-		return nil, err
+	if fd, err := unix.MemfdCreate(name, 0); err == nil {
+		// Wrap in os.File for easy Go IO, but we manage the FD manually mostly
+		return &ReusableMemFD{
+			Fd:         fd,
+			File:       os.NewFile(uintptr(fd), name),
+			Path:       fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), fd),
+			isDiskFile: false,
+		}, nil
 	}
-	// Wrap in os.File for easy Go IO, but we manage the FD manually mostly
-	return &ReusableMemFD{
-		Fd:         fd,
-		File:       os.NewFile(uintptr(fd), name),
-		Path:       fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), fd),
-		isDiskFile: false,
-	}, nil
 
-	// try to create a standard Disk-backed temporary file as fallback
-	// fallback on all MemfdCreate errors to increase compatibility
+	// fallback on all MemfdCreate errors to increase compatibility: a kernel
+	// without memfd_create is the reason this path exists, and it reports that
+	// as any of several errnos.
+	return newDiskBackedFD(name)
+}
+
+// newDiskBackedFD is NewReusableMemFD's fallback: a standard disk-backed
+// temporary file, which Close removes again. It is split out because on a kernel
+// that has memfd_create -- every kernel this is tested on -- the fallback is
+// otherwise unreachable, and an untested fallback is where the bugs live.
+func newDiskBackedFD(name string) (*ReusableMemFD, error) {
 	tmpFile, err := os.CreateTemp("", fmt.Sprintf("snap-delta-%s-", name))
 	if err != nil {
 		return nil, fmt.Errorf("memfd creation failed and disk fallback failed: %w", err)
