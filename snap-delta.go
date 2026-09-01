@@ -82,6 +82,7 @@ const (
 	Xdelta3Format DeltaFormat = iota
 	SnapXdelta3Format
 	SnapHdiffzFormat
+	SnapBlockPlanFormat
 
 	// Identifiers for the store
 	xdelta3Format = "xdelta3"
@@ -315,13 +316,16 @@ func formatStoreString(id DeltaFormat) string {
 		return snapDeltaFormatXdelta3
 	case SnapHdiffzFormat:
 		return snapDeltaFormatHdiffz
+	case SnapBlockPlanFormat:
+		return snapDeltaFormatBlocks
 	}
 	return "unexpected"
 }
 
 // Supported delta formats
 func SupportedDeltaFormats() []string {
-	return []string{formatStoreString(SnapHdiffzFormat), formatStoreString(SnapXdelta3Format), formatStoreString(Xdelta3Format)}
+	return []string{formatStoreString(SnapBlockPlanFormat), formatStoreString(SnapHdiffzFormat),
+		formatStoreString(SnapXdelta3Format), formatStoreString(Xdelta3Format)}
 }
 
 // GenerateDelta creates a delta file called delta from sourceSnap and
@@ -339,6 +343,10 @@ func GenerateDelta(sourceSnap, targetSnap, delta string, deltaFormat DeltaFormat
 		return generateSnapDelta(ctx, cancel, sourceSnap, targetSnap, delta, DeltaToolXdelta3)
 	case SnapHdiffzFormat:
 		return generateSnapDelta(ctx, cancel, sourceSnap, targetSnap, delta, DeltaToolHdiffz)
+	case SnapBlockPlanFormat:
+		_, err := generateBlockPlan(ctx, sourceSnap, targetSnap, delta,
+			blockPlanGenOpts{Comp: &xzCLI{}, Verify: true})
+		return err
 	default:
 		return fmt.Errorf("unsupported delta format %d", deltaFormat)
 	}
@@ -423,6 +431,13 @@ func ApplyDelta(sourceSnap, delta, targetSnap string) error {
 			return fmt.Errorf("cannot decode header: %w", err)
 		}
 		return applySnapDelta(ctx, cancel, sourceSnap, targetSnap, deltaFile, hdr)
+	case blockPlanMagic:
+		// The block plan reads its own header, so hand the whole file back
+		// from the start.
+		if _, err := deltaFile.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		return applyBlockPlanToFile(ctx, sourceSnap, deltaFile, targetSnap, blockPlanApplyOpts{Comp: &xzCLI{}})
 	default:
 		return fmt.Errorf("unknown delta file format")
 	}
@@ -1877,7 +1892,12 @@ func main() {
 
 	// Setup subcommands
 	var genSource, genTarget, genDelta, appSource, appTarget, appDelta string
-	var xdelta3Tool, hdiffzTool bool
+	var xdelta3Tool, hdiffzTool, blocksFormat bool
+	var genThreads, genMaxRun int
+	var genNoVerify, genNoPatchRuns, genNoPathMatch bool
+	var genWindowRatio, genMinSavingRate float64
+	var appReport bool
+	var appMaxRun int
 	generateCmd := flag.NewFlagSet("generate", flag.ExitOnError)
 	generateCmd.StringVar(&genSource, "source", "", "source snap file (required)")
 	generateCmd.StringVar(&genSource, "s", "", "source snap file (required)")
@@ -1887,8 +1907,20 @@ func main() {
 	generateCmd.StringVar(&genDelta, "d", "", "delta output file (required)")
 	generateCmd.BoolVar(&xdelta3Tool, "xdelta3", false, "used complression tool")
 	generateCmd.BoolVar(&hdiffzTool, "hdiffz", false, "used complression tool")
+	generateCmd.BoolVar(&blocksFormat, "blocks", false, "generate a "+snapDeltaFormatBlocks+" delta, which the applier can assemble without recompressing unchanged blocks")
+	generateCmd.IntVar(&genThreads, "threads", 0, "xz thread count, at least 2 (0 = default)")
+	generateCmd.IntVar(&genMaxRun, "max-run", 0, "cap on the plaintext one patch run reconstructs, which bounds apply memory (0 = default)")
+	generateCmd.BoolVar(&genNoVerify, "no-verify", false, "skip running the applier over the finished delta (--blocks only)")
+	// The last four drive the cost model from the command line, which is how its
+	// defaults were measured; nothing but a sweep should pass them.
+	generateCmd.BoolVar(&genNoPatchRuns, "no-patch-runs", false, "ship every changed block as a literal, asking the device for no data-block compression at all")
+	generateCmd.BoolVar(&genNoPathMatch, "no-path-match", false, "anchor patch runs by source offset alone, ignoring which file a block belongs to")
+	generateCmd.Float64Var(&genWindowRatio, "window-ratio", 0, "source window size as a multiple of a run's plaintext (0 = default)")
+	generateCmd.Float64Var(&genMinSavingRate, "min-saving-rate", 0, "delta bytes a run must save per byte of plaintext it makes the device compress (0 = default)")
 
 	applyCmd := flag.NewFlagSet("apply", flag.ExitOnError)
+	applyCmd.BoolVar(&appReport, "stats", false, "report what the apply cost")
+	applyCmd.IntVar(&appMaxRun, "max-run", 0, "refuse a delta whose patch runs need more than this many bytes at once (0 = accept any)")
 	applyCmd.StringVar(&appSource, "source", "", "source snap file (required)")
 	applyCmd.StringVar(&appSource, "s", "", "source snap file (required)")
 	applyCmd.StringVar(&appTarget, "target", "", "target snap file (required)")
@@ -1905,6 +1937,23 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Usage: go run snap-delta apply [options]")
 		applyCmd.PrintDefaults()
 	}
+
+	// Development subcommands for the block-plan format: 'inspect' dumps an
+	// image's layout, 'selftest' is the gate that the local xz reproduces the
+	// image's own blocks byte for byte.
+	var stSample, stThreads int
+	selftestCmd := flag.NewFlagSet("selftest", flag.ExitOnError)
+	selftestCmd.IntVar(&stSample, "sample", 0, "check only this many data blocks, spread across the image (0 = all)")
+	selftestCmd.IntVar(&stThreads, "threads", 0, "xz thread count, at least 2 (0 = default)")
+	selftestCmd.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: snap-delta selftest [options] <image>...")
+		selftestCmd.PrintDefaults()
+	}
+	inspectCmd := flag.NewFlagSet("inspect", flag.ExitOnError)
+	inspectCmd.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: snap-delta inspect <image>...")
+	}
+
 	var err error
 	switch os.Args[1] {
 	case "generate":
@@ -1912,6 +1961,18 @@ func main() {
 		if genSource == "" || genTarget == "" || genDelta == "" {
 			generateCmd.Usage()
 			log.Fatal("Missing required parameters for 'generate'")
+		}
+		if blocksFormat {
+			err = cmdGenerateBlocks(context.Background(), genSource, genTarget, genDelta, genCmdOpts{
+				Threads:       genThreads,
+				MaxRun:        genMaxRun,
+				Verify:        !genNoVerify,
+				NoPatchRuns:   genNoPatchRuns,
+				NoPathMatch:   genNoPathMatch,
+				WindowRatio:   genWindowRatio,
+				MinSavingRate: genMinSavingRate,
+			})
+			break
 		}
 		var deltaFormat DeltaFormat
 		if hdiffzTool {
@@ -1930,7 +1991,35 @@ func main() {
 			applyCmd.Usage()
 			log.Fatal("Missing required parameters for 'apply'")
 		}
+		if appReport {
+			// Reporting needs the block-plan applier's own numbers, so take
+			// that path directly rather than through the magic switch, which
+			// returns nothing.
+			var df *os.File
+			if df, err = os.Open(appDelta); err == nil {
+				defer df.Close()
+				_, err = applyBlockPlanReport(context.Background(), appSource, df, appTarget,
+					blockPlanApplyOpts{MaxRunUSize: appMaxRun}, true)
+			}
+			break
+		}
 		err = ApplyDelta(appSource, appDelta, appTarget)
+
+	case "selftest":
+		selftestCmd.Parse(os.Args[2:])
+		if selftestCmd.NArg() == 0 {
+			selftestCmd.Usage()
+			log.Fatal("Missing image arguments for 'selftest'")
+		}
+		err = cmdSelftest(context.Background(), selftestCmd.Args(), stSample, stThreads)
+
+	case "inspect":
+		inspectCmd.Parse(os.Args[2:])
+		if inspectCmd.NArg() == 0 {
+			inspectCmd.Usage()
+			log.Fatal("Missing image arguments for 'inspect'")
+		}
+		err = cmdInspect(context.Background(), inspectCmd.Args())
 
 	case "--help", "-h":
 		printUsageAndExit("")
@@ -1956,6 +2045,8 @@ func printUsageAndExit(msg ...string) {
 	fmt.Fprintln(os.Stderr, "Operations:")
 	fmt.Fprintln(os.Stderr, "\tgenerate: generate delta between source and target")
 	fmt.Fprintln(os.Stderr, "\tapply:    apply delta on the source")
+	fmt.Fprintln(os.Stderr, "\tinspect:  dump the byte layout of one or more squashfs images")
+	fmt.Fprintln(os.Stderr, "\tselftest: check that the local xz reproduces an image's own blocks")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Compulsory arguments:")
 	fmt.Fprintln(os.Stderr, "\t--source | -s: source snap")
