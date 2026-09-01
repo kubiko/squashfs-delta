@@ -80,8 +80,11 @@ const (
 	inodeTypeFile    = 2
 	inodeTypeExtFile = 9
 
-	// compressorXz is the squashfs compressor id for xz.
-	compressorXz = 4
+	// The squashfs compressor ids this format implements. The full set is in
+	// compressorNames, which covers the ones it refuses too.
+	compressorLzo  = 3
+	compressorXz   = 4
+	compressorZstd = 6
 
 	// squashfsPadding is the alignment mksquashfs zero-pads the image to.
 	squashfsPadding = 4096

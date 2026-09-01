@@ -1,0 +1,461 @@
+// -*- Mode: Go; indent-tabs-mode: t -*-
+
+//go:build cgo
+
+/*
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3 as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+package main
+
+/*
+#cgo LDFLAGS: -ldl
+
+#include <dlfcn.h>
+#include <stddef.h>
+#include <stdlib.h>
+
+// The three entry points squashfs-tools' lzo_wrapper.c uses, declared here
+// rather than pulled from lzo/lzo1x.h so that no lzo development package is
+// needed to build. lzo_uint is size_t on every platform LZO builds on with the
+// default configuration, which is what the library the loader finds was built
+// with.
+typedef size_t lzo_uint;
+
+typedef int (*sqd_lzo_999_fn)(const unsigned char *src, lzo_uint src_len,
+	unsigned char *dst, lzo_uint *dst_len, void *wrkmem,
+	const unsigned char *dict, lzo_uint dict_len, void *cb, int level);
+typedef int (*sqd_lzo_opt_fn)(unsigned char *src, lzo_uint src_len,
+	unsigned char *dst, lzo_uint *dst_len, void *wrkmem);
+typedef int (*sqd_lzo_dec_fn)(const unsigned char *src, lzo_uint src_len,
+	unsigned char *dst, lzo_uint *dst_len, void *wrkmem);
+
+static sqd_lzo_999_fn sqd_lzo_999;
+static sqd_lzo_opt_fn sqd_lzo_opt;
+static sqd_lzo_dec_fn sqd_lzo_dec;
+
+// sqd_lzo_load resolves the entry points from one library path, returning a
+// dlerror string on failure and NULL on success.
+static const char *sqd_lzo_load(const char *path) {
+	void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+	if (h == NULL) {
+		return dlerror();
+	}
+	sqd_lzo_999 = (sqd_lzo_999_fn)dlsym(h, "lzo1x_999_compress_level");
+	sqd_lzo_opt = (sqd_lzo_opt_fn)dlsym(h, "lzo1x_optimize");
+	sqd_lzo_dec = (sqd_lzo_dec_fn)dlsym(h, "lzo1x_decompress_safe");
+	if (sqd_lzo_999 == NULL || sqd_lzo_opt == NULL || sqd_lzo_dec == NULL) {
+		dlclose(h);
+		return "library does not export the lzo1x entry points";
+	}
+	return NULL;
+}
+
+// Status codes, distinguishing which stage failed. The library's own error code
+// comes back in lzo_err.
+enum {
+	SQD_LZO_OK = 0,
+	SQD_LZO_COMPRESS_FAILED = 1,
+	SQD_LZO_OVERFLOW = 2,
+	SQD_LZO_OPTIMIZE_FAILED = 3,
+	SQD_LZO_OPTIMIZE_SHORT = 4,
+	SQD_LZO_DECOMPRESS_FAILED = 5,
+};
+
+// sqd_lzo_compress is lzo_wrapper.c's lzo_compress for the default
+// configuration: lzo1x_999 at level 8, then the lzo1x_optimize pass over the
+// result. The optimize pass is not an optional extra -- it rewrites the
+// compressed stream, so skipping it produces different bytes from mksquashfs
+// for the same input.
+//
+// ref is where optimize decompresses the stream as it goes. mksquashfs hands it
+// the source buffer itself; this passes a copy instead, because here the source
+// can be a read-only mapping of the image being read.
+static int sqd_lzo_compress(const unsigned char *src, int src_len,
+		unsigned char *dst, int dst_cap, unsigned char *ref, void *wrkmem,
+		int *comp_len, int *lzo_err) {
+	lzo_uint comp = 0;
+	int res = sqd_lzo_999(src, (lzo_uint)src_len, dst, &comp, wrkmem, NULL, 0, NULL, 8);
+	*lzo_err = res;
+	if (res != 0) {
+		return SQD_LZO_COMPRESS_FAILED;
+	}
+	if (comp > (lzo_uint)dst_cap) {
+		*comp_len = (int)comp;
+		return SQD_LZO_OVERFLOW;
+	}
+	lzo_uint orig = (lzo_uint)src_len;
+	res = sqd_lzo_opt(dst, comp, ref, &orig, NULL);
+	*lzo_err = res;
+	if (res != 0) {
+		return SQD_LZO_OPTIMIZE_FAILED;
+	}
+	if (orig != (lzo_uint)src_len) {
+		*comp_len = (int)orig;
+		return SQD_LZO_OPTIMIZE_SHORT;
+	}
+	*comp_len = (int)comp;
+	return SQD_LZO_OK;
+}
+
+// sqd_lzo_decompress is the safe decompressor, which is what a device must use:
+// the bytes come from a delta and a source image, neither of which this process
+// produced, and the unsafe variant walks past the end of a truncated stream.
+static int sqd_lzo_decompress(const unsigned char *src, int src_len,
+		unsigned char *dst, int dst_cap, int *out_len, int *lzo_err) {
+	lzo_uint out = (lzo_uint)dst_cap;
+	int res = sqd_lzo_dec(src, (lzo_uint)src_len, dst, &out, NULL);
+	*lzo_err = res;
+	if (res != 0) {
+		return SQD_LZO_DECOMPRESS_FAILED;
+	}
+	*out_len = (int)out;
+	return SQD_LZO_OK;
+}
+*/
+import "C"
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"unsafe"
+)
+
+// This file reproduces the lzo compressor, which mksquashfs uses when built with
+// lzo support and asked for `-comp lzo`.
+//
+// Two things make it unlike xz. First, there is no command line tool that
+// produces a squashfs lzo block: `lzop` writes its own container, so the library
+// has to be called directly -- see dynlib.go for where it comes from. Second,
+// an lzo block carries no length and no end marker anywhere, so a run of them
+// cannot be walked without being told each block's on-disk size, which is why
+// NeedsBlockSizes is true and why the instruction stream carries
+// SrcWindow.CSizes for these images.
+//
+// What "reproduce" means here is lzo_wrapper.c's default configuration exactly:
+// lzo1x_999 at level 8 followed by lzo1x_optimize. The wrapper accepts
+// -Xalgorithm and -Xcompression-level, but an image built with either carries
+// COMPRESSOR_OPTIONS, which checkSupportedGeometry refuses -- so the only
+// configuration that reaches this code is the default one.
+
+func init() {
+	compressorFactories[compressorLzo] = func(threads int) (Compressor, error) {
+		return newLZOCompressor()
+	}
+	blobDecoders[codecLZO] = lzoDecompressBlob
+}
+
+const (
+	// lzoWorkspaceSize is LZO1X_999_MEM_COMPRESS: the scratch lzo1x_999 needs,
+	// 14 * 16384 entries of two bytes. The library takes it from the caller
+	// and never allocates, which is why one of these is held per compressor
+	// rather than per call.
+	lzoWorkspaceSize = 14 * 16384 * 2
+
+	// lzoMaxBlocksPerCall matches xz's cap. Nothing here needs one -- there is
+	// no argv to overflow -- but the cap is also what bounds the plaintext a
+	// caller assembles before calling, and that is worth keeping the same
+	// whichever compressor is in use.
+	lzoMaxBlocksPerCall = 8192
+)
+
+// lzoLibSoname is what to dlopen. The version suffix is the soname, not a
+// preference: liblzo2.so.2 is the only ABI the library has ever shipped.
+const lzoLibSoname = "liblzo2.so.2"
+
+var lzoLoad struct {
+	sync.Once
+	path string
+	err  error
+}
+
+// loadLZO opens the library once per process.
+//
+// Once per process rather than once per compressor because the resolved entry
+// points are process-global: dlopen returns the same object for a second
+// request anyway, so there is nothing per-instance to keep.
+func loadLZO() (string, error) {
+	lzoLoad.Do(func() {
+		var tried []string
+		for _, cand := range libraryCandidates(lzoLibSoname) {
+			cpath := C.CString(cand)
+			msg := C.sqd_lzo_load(cpath)
+			C.free(unsafe.Pointer(cpath))
+			if msg == nil {
+				lzoLoad.path = cand
+				return
+			}
+			tried = append(tried, fmt.Sprintf("%s: %s", cand, C.GoString(msg)))
+		}
+		lzoLoad.err = fmt.Errorf("cannot load %s, needed for lzo images: %s",
+			lzoLibSoname, strings.Join(tried, "; "))
+	})
+	return lzoLoad.path, lzoLoad.err
+}
+
+// lzoCompressBound is LZO_MAX_EXPANSION: what lzo1x_999 may write for a block it
+// cannot compress at all. mksquashfs sizes its own output buffer the same way.
+func lzoCompressBound(n int) int { return n + n/16 + 64 + 3 }
+
+// lzoCompressor reproduces squashfs lzo blocks through the dlopen'd library.
+//
+// The four buffers are why one of these belongs to one goroutine at a time, as
+// Compressor documents: they are reused across every block of every call, which
+// keeps a whole-image generate from allocating per block.
+type lzoCompressor struct {
+	wrk  []byte // lzo1x_999 workspace
+	cbuf []byte // compressed output
+	ref  []byte // lzo1x_optimize reference buffer
+	ubuf []byte // decompressed output
+}
+
+func newLZOCompressor() (*lzoCompressor, error) {
+	if _, err := loadLZO(); err != nil {
+		return nil, err
+	}
+	return &lzoCompressor{wrk: make([]byte, lzoWorkspaceSize)}, nil
+}
+
+func (l *lzoCompressor) ID() uint16 { return compressorLzo }
+
+func (l *lzoCompressor) MaxBlocksPerCall() int { return lzoMaxBlocksPerCall }
+
+// NeedsBlockSizes is true: an lzo block ends where the next one begins and
+// nothing in the stream says where that is. The image records the length in an
+// inode or a metadata header, so a delta that describes a window of source
+// blocks has to carry it too.
+func (l *lzoCompressor) NeedsBlockSizes() bool { return true }
+
+func (l *lzoCompressor) SectionCodec() uint16 { return codecLZO }
+
+// grow returns a slice of at least n bytes from buf, reallocating when it is
+// short. The returned slice is what to use; the field keeps the capacity.
+func grow(buf *[]byte, n int) []byte {
+	if cap(*buf) < n {
+		*buf = make([]byte, n)
+	}
+	return (*buf)[:n]
+}
+
+// compressBlock compresses one block, returning its on-disk bytes and whether
+// mksquashfs would have stored it raw.
+//
+// The raw decision is mangle2()'s, not the wrapper's: a block whose compressed
+// form is no smaller than its plaintext goes into the image verbatim. The
+// wrapper's own refusal -- output longer than the block size -- is subsumed by
+// it, since a block is never longer than the block size.
+func (l *lzoCompressor) compressBlock(src []byte) (onDisk []byte, raw bool, err error) {
+	dst := grow(&l.cbuf, lzoCompressBound(len(src)))
+	ref := grow(&l.ref, len(src))
+	var compLen, lzoErr C.int
+	st := C.sqd_lzo_compress(
+		(*C.uchar)(unsafe.Pointer(&src[0])), C.int(len(src)),
+		(*C.uchar)(unsafe.Pointer(&dst[0])), C.int(len(dst)),
+		(*C.uchar)(unsafe.Pointer(&ref[0])), unsafe.Pointer(&l.wrk[0]),
+		&compLen, &lzoErr)
+	switch st {
+	case C.SQD_LZO_OK:
+	case C.SQD_LZO_COMPRESS_FAILED:
+		return nil, false, fmt.Errorf("lzo1x_999_compress_level failed with %d", int(lzoErr))
+	case C.SQD_LZO_OVERFLOW:
+		return nil, false, fmt.Errorf("lzo1x_999 wrote %d bytes for %d, past the %d-byte bound",
+			int(compLen), len(src), len(dst))
+	case C.SQD_LZO_OPTIMIZE_FAILED:
+		return nil, false, fmt.Errorf("lzo1x_optimize failed with %d", int(lzoErr))
+	case C.SQD_LZO_OPTIMIZE_SHORT:
+		return nil, false, fmt.Errorf("lzo1x_optimize round-tripped %d bytes of %d", int(compLen), len(src))
+	default:
+		return nil, false, fmt.Errorf("lzo compression returned unknown status %d", int(st))
+	}
+	if int(compLen) >= len(src) {
+		return src, true, nil
+	}
+	return dst[:compLen], false, nil
+}
+
+func (l *lzoCompressor) CompressBlocks(ctx context.Context, plain BlockPlain, uSizes []int, dictSize int, fn func(int, CompressedBlock) error) error {
+	if len(uSizes) == 0 {
+		return nil
+	}
+	if len(uSizes) > lzoMaxBlocksPerCall {
+		return fmt.Errorf("%d blocks in one call exceeds the cap of %d", len(uSizes), lzoMaxBlocksPerCall)
+	}
+	total := 0
+	for i, u := range uSizes {
+		if u <= 0 {
+			return fmt.Errorf("block %d has non-positive size %d", i, u)
+		}
+		total += u
+	}
+	if total != plain.Len() {
+		return fmt.Errorf("block sizes sum to %d but %d bytes of plaintext were given", total, plain.Len())
+	}
+	// dictSize is ignored, and deliberately not validated against anything: lzo
+	// has no dictionary and no window parameter, so a metadata block and a data
+	// block of the same content compress to the same bytes. The parameter stays
+	// in the interface because xz needs it.
+	off := 0
+	for i, u := range uSizes {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		src, err := plain.Block(off, u)
+		if err != nil {
+			return err
+		}
+		onDisk, raw, err := l.compressBlock(src)
+		if err != nil {
+			return fmt.Errorf("block %d: %w", i, err)
+		}
+		if err := fn(i, CompressedBlock{OnDisk: onDisk, Raw: raw, USize: u}); err != nil {
+			return err
+		}
+		off += u
+	}
+	return nil
+}
+
+// decompressBlock decompresses one block into scratch, returning the plaintext.
+// It is valid until the next call.
+func (l *lzoCompressor) decompressBlock(src []byte, maxUSize int) ([]byte, error) {
+	if len(src) == 0 {
+		return nil, fmt.Errorf("empty compressed block")
+	}
+	dst := grow(&l.ubuf, maxUSize)
+	var outLen, lzoErr C.int
+	st := C.sqd_lzo_decompress(
+		(*C.uchar)(unsafe.Pointer(&src[0])), C.int(len(src)),
+		(*C.uchar)(unsafe.Pointer(&dst[0])), C.int(len(dst)),
+		&outLen, &lzoErr)
+	if st != C.SQD_LZO_OK {
+		return nil, fmt.Errorf("lzo1x_decompress_safe failed with %d", int(lzoErr))
+	}
+	if int(outLen) <= 0 || int(outLen) > maxUSize {
+		return nil, fmt.Errorf("block decompressed to %d bytes, outside (0,%d]", int(outLen), maxUSize)
+	}
+	return dst[:outLen], nil
+}
+
+func (l *lzoCompressor) DecompressBlocks(ctx context.Context, dst, src []byte, cSizes []int, maxUSize int) ([]byte, []int, error) {
+	if len(cSizes) == 0 {
+		if len(src) != 0 {
+			return nil, nil, fmt.Errorf("%d bytes of blocks with no sizes given", len(src))
+		}
+		return dst, nil, nil
+	}
+	uSizes := make([]int, 0, len(cSizes))
+	off := 0
+	for i, c := range cSizes {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		if c <= 0 || off+c > len(src) {
+			return nil, nil, fmt.Errorf("block %d claims %d bytes with %d of %d left",
+				i, c, len(src)-off, len(src))
+		}
+		plain, err := l.decompressBlock(src[off:off+c], maxUSize)
+		if err != nil {
+			return nil, nil, fmt.Errorf("block %d: %w", i, err)
+		}
+		dst = append(dst, plain...)
+		uSizes = append(uSizes, len(plain))
+		off += c
+	}
+	if off != len(src) {
+		return nil, nil, fmt.Errorf("%d bytes follow the last of %d blocks", len(src)-off, len(cSizes))
+	}
+	return dst, uSizes, nil
+}
+
+// DecompressTo streams a run of blocks, reading each one's on-disk bytes and
+// writing its plaintext before touching the next. cSizes is required: without
+// it there is nothing to say where a block ends.
+func (l *lzoCompressor) DecompressTo(ctx context.Context, w io.Writer, r io.Reader, cSizes []int, maxUSize, wantLen int) (int64, error) {
+	if len(cSizes) == 0 {
+		return 0, fmt.Errorf("lzo needs each block's size to decompress a run")
+	}
+	var written int64
+	var stored []byte
+	for i, c := range cSizes {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		if c <= 0 {
+			return written, fmt.Errorf("block %d claims %d bytes", i, c)
+		}
+		stored = grow(&stored, c)
+		if _, err := io.ReadFull(r, stored); err != nil {
+			return written, fmt.Errorf("reading block %d of %d bytes: %w", i, c, err)
+		}
+		plain, err := l.decompressBlock(stored, maxUSize)
+		if err != nil {
+			return written, fmt.Errorf("block %d: %w", i, err)
+		}
+		n, err := w.Write(plain)
+		written += int64(n)
+		if err != nil {
+			return written, err
+		}
+	}
+	if wantLen >= 0 && written != int64(wantLen) {
+		return written, fmt.Errorf("run decompressed to %d bytes, expected %d", written, wantLen)
+	}
+	return written, nil
+}
+
+// CompressBlob compresses a whole blob as one lzo block, which is all a section
+// codec needs: the section table records the raw length, so the decoder knows
+// how much to expect without any framing of its own.
+//
+// This is container compression, unrelated to reproducing image blocks, and the
+// only reason it is lzo at all is so that an lzo device needs no second
+// compressor to read the instruction stream.
+func (l *lzoCompressor) CompressBlob(ctx context.Context, raw []byte) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("nothing to compress")
+	}
+	onDisk, isRaw, err := l.compressBlock(raw)
+	if err != nil {
+		return nil, err
+	}
+	if isRaw {
+		// Incompressible: hand back something no shorter than the input, which
+		// is how addSectionCompressed is told to store it uncompressed.
+		return append([]byte(nil), raw...), nil
+	}
+	return append([]byte(nil), onDisk...), nil
+}
+
+// lzoDecompressBlob undoes CompressBlob, and is what decompressBlob dispatches
+// codecLZO to. It loads the library itself, because a section is decoded before
+// the delta's superblock has been parsed and so before any compressor exists.
+func lzoDecompressBlob(ctx context.Context, stored []byte, rawLen int) ([]byte, error) {
+	l, err := newLZOCompressor()
+	if err != nil {
+		return nil, err
+	}
+	if rawLen <= 0 {
+		return nil, fmt.Errorf("section declares %d raw bytes", rawLen)
+	}
+	plain, err := l.decompressBlock(stored, rawLen)
+	if err != nil {
+		return nil, err
+	}
+	if len(plain) != rawLen {
+		return nil, fmt.Errorf("section decompressed to %d bytes, expected %d", len(plain), rawLen)
+	}
+	return append([]byte(nil), plain...), nil
+}

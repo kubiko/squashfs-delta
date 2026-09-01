@@ -66,10 +66,13 @@ const (
 	secPay     uint16 = 7 // patch blobs and literal bytes, in instruction order
 )
 
-// Section codecs.
+// Section codecs. Each compressor names the one it writes -- see
+// Compressor.SectionCodec -- so which of these a delta uses follows from the
+// image it describes.
 const (
 	codecNone uint16 = 0
 	codecXZ   uint16 = 1
+	codecLZO  uint16 = 2
 )
 
 func sectionName(id uint16) string {
@@ -440,6 +443,13 @@ func (br *blockPlanReader) hasSection(id uint16) bool {
 
 // --- whole-blob section codecs ---
 
+// blobDecoders undoes each section codec. Codecs beyond xz are registered by
+// the files that need cgo, so a build without it reports a codec it cannot
+// decode rather than failing to link.
+var blobDecoders = map[uint16]func(ctx context.Context, stored []byte, rawLen int) ([]byte, error){
+	codecXZ: xzDecompressAll,
+}
+
 // decompressBlob undoes a section codec.
 //
 // It dispatches on the codec the section table records rather than on the
@@ -447,9 +457,8 @@ func (br *blockPlanReader) hasSection(id uint16) bool {
 // -- and because a codec is a property of the delta container, not of the image
 // the delta describes. Each compressor's SectionCodec names the one it writes.
 func decompressBlob(ctx context.Context, codec uint16, stored []byte, rawLen int) ([]byte, error) {
-	switch codec {
-	case codecXZ:
-		return xzDecompressAll(ctx, stored, rawLen)
+	if dec, ok := blobDecoders[codec]; ok {
+		return dec(ctx, stored, rawLen)
 	}
 	return nil, fmt.Errorf("unknown codec %d", codec)
 }

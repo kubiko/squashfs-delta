@@ -40,7 +40,7 @@ import (
 // number, so the only thing that can go wrong here is a mismatch -- and every
 // mismatch is checked:
 //
-//   - SEC_CANARY proves the local xz reproduces the generator's bytes, before a
+//   - SEC_CANARY proves the local compressor reproduces the generator's bytes, before a
 //     single target byte is written;
 //   - every recompressed block's on-disk length must equal the recorded one;
 //   - the data region must end exactly on inode_table_start, the metadata region
@@ -655,6 +655,11 @@ const canaryPayloadLen = 4 + 2*36
 
 // canaryDicts are the two configurations a delta uses, in the order the payload
 // records them.
+//
+// For a compressor with no dictionary the two coincide and the payload records
+// the same block twice, which costs 36 bytes and is left alone: the check is
+// about the compressor's output drifting, and a compressor whose output does not
+// depend on this parameter has no third case to cover.
 func canaryDicts(blockSize int) [2]int { return [2]int{blockSize, squashfsMetadataSize} }
 
 // buildCanary compresses the head of the source metadata blob under both
@@ -679,9 +684,9 @@ func buildCanary(ctx context.Context, srcMeta []byte, comp Compressor, blockSize
 	return out, nil
 }
 
-// checkCanary is the toolchain gate: if the local xz does not reproduce the
-// generator's bytes then no block can be recompressed here, and that has to be
-// found now rather than halfway through assembling an image.
+// checkCanary is the toolchain gate: if the local compressor does not reproduce
+// the generator's bytes then no block can be recompressed here, and that has to
+// be found now rather than halfway through assembling an image.
 func checkCanary(ctx context.Context, canary, srcMeta []byte, comp Compressor, blockSize int) error {
 	if len(canary) != canaryPayloadLen {
 		return fmt.Errorf("SEC_CANARY is %d bytes, want %d", len(canary), canaryPayloadLen)
@@ -699,8 +704,8 @@ func checkCanary(ctx context.Context, canary, srcMeta []byte, comp Compressor, b
 		}
 		sum := sha256.Sum256(blk)
 		if uint32(len(blk)) != wantLen || !bytes.Equal(sum[:], wantSum) {
-			return fmt.Errorf("incompatible xz toolchain: with dict=%d the canary compresses to %d bytes %x, the delta expects %d bytes %x",
-				dict, len(blk), sum[:8], wantLen, wantSum[:8])
+			return fmt.Errorf("incompatible %s toolchain: with dict=%d the canary compresses to %d bytes %x, the delta expects %d bytes %x",
+				compressorName(comp.ID()), dict, len(blk), sum[:8], wantLen, wantSum[:8])
 		}
 	}
 	return nil

@@ -32,9 +32,11 @@ import (
 //  2. recompressing a block's contents reproduces its on-disk bytes byte for
 //     byte, so an unchanged block can be copied instead of recompressed.
 //
-// `selftest` is the gate: if (2) ever fails on a machine, the local xz differs
-// from the one that built the image and no delta of this format may be produced
-// there. That is what ToolsVersion in the header exists to invalidate.
+// `selftest` is the gate: if (2) ever fails on a machine, the local compressor
+// differs from the one that built the image and no delta of this format may be
+// produced there. That is what ToolsVersion in the header exists to invalidate.
+// Each image is checked with the compressor its own superblock names, so a
+// directory of snaps built with different ones reports one line each.
 
 // selftestResult tallies one image.
 type selftestResult struct {
