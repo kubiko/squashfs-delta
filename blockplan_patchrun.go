@@ -353,6 +353,26 @@ type builtRun struct {
 	patch   []byte
 }
 
+// runLogHeader explains the columns of the per-run log. It is printed once,
+// before the first run, by whoever set RunLog.
+//
+// It sits here rather than beside that caller because the line it describes is
+// written a few lines below: a column added to one and not the other is the
+// kind of drift that makes a log worse than none, and keeping both in view is
+// what stops it.
+const runLogHeader = `run log columns, one line per patch run considered:
+  tgt=OFF          the run's first block, as a byte offset into the target's data region
+  blocks=N         how many consecutive target blocks the run covers
+  u=BYTES          the run's plaintext, which is what the device would recompress
+  win=OFF,U,xN     the source given to the diff: first byte offset, total plaintext, number of windows
+  patch=BYTES      what hdiffz produced, which is what the delta would carry
+  lit=BYTES        what the same blocks cost shipped verbatim, which patch has to beat
+  anchor=OFF,HOW   where in the source the run was expected to live, and how that was decided:
+                   path (same file in both revisions), fuzzy (a version bump in the name),
+                   cursor (no correspondence found, so the previous match's position stands)
+a run whose patch does not beat lit by enough is not logged as rejected here; the
+generator's summary counts those.`
+
 // buildPatchRun tries to turn a candidate into a patch run. It returns nil, nil
 // when the run should ship as literals instead -- because no window was
 // available, because a block did not recompress to the target's bytes, or

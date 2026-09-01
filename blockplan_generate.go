@@ -199,6 +199,13 @@ func generateBlockPlan(ctx context.Context, sourcePath, targetPath, deltaPath st
 	if opts.MaxRunUSize < blockSize {
 		return nil, fmt.Errorf("run cap %d is below one block (%d)", opts.MaxRunUSize, blockSize)
 	}
+	// The log is a wall of numbers and abbreviations, so it says what they mean
+	// before the first of them. Printed here rather than by the caller that
+	// opened the writer, so that every caller gets it -- and only once a
+	// generate has got far enough that there will be runs to log.
+	if opts.RunLog != nil {
+		fmt.Fprintln(opts.RunLog, runLogHeader)
+	}
 
 	srcExt, gaps, overlaps, err := src.CheckCoverage(ctx)
 	if err != nil {
