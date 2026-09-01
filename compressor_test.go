@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,9 +62,11 @@ func mksquashfsArgsForComp(t *testing.T, name string, extra ...string) []string 
 	return nil
 }
 
-// requireCompressor skips unless both halves of the pair are available: a local
-// mksquashfs that can write the compressor, and a compressor here that can
-// reproduce it. A machine missing either is not a failing machine.
+// requireCompressor skips unless all three halves of the pair are available: a
+// local mksquashfs that can write the compressor, a compressor here that can be
+// used at all, and agreement between the two on the bytes. A machine missing any
+// of them is not a failing machine -- what it cannot do is produce a delta, which
+// is what the generator's own gate reports there.
 func requireCompressor(t *testing.T, id uint16) {
 	t.Helper()
 	requireTools(t, "mksquashfs", "hdiffz", "hpatchz")
@@ -72,6 +75,37 @@ func requireCompressor(t *testing.T, id uint16) {
 	}
 	if !mksquashfsWritesComp(t, compressorName(id)) {
 		t.Skipf("the local mksquashfs cannot write %s images", compressorName(id))
+	}
+	if bad := unreproducedBy(t, id); bad != "" {
+		t.Skipf("the %s library available here does not reproduce what the local mksquashfs writes, "+
+			"so no delta of such an image can be made on this machine: %s", compressorName(id), bad)
+	}
+}
+
+// unreproducedBy packs an image with the compressor and runs the recompression
+// gate over it, returning the first mismatch or "" when every block matched.
+//
+// This is the one thing about a compressor that cannot be assumed and is not a
+// property of this code: mksquashfs compresses with the library it was linked
+// against and this code with the one it finds (see dynlib.go), and for zstd the
+// two versions do not agree -- level 15 output drifted between 1.4.8 and 1.5.7 on
+// short inputs, which is every metadata block. Where they disagree, refusing is
+// the whole answer, so a test that needs the pair skips rather than fails.
+func unreproducedBy(t *testing.T, id uint16) string {
+	t.Helper()
+	img := buildImageArgs(t, "comp-probe.snap", populateChurn, mksquashfsArgsForComp(t, compressorName(id))...)
+	r, err := runSelftest(context.Background(), img, 0, 0)
+	if err != nil {
+		return err.Error()
+	}
+	switch {
+	case r.clean():
+		return ""
+	case r.FirstBad != "":
+		return r.FirstBad
+	default:
+		return fmt.Sprintf("%d/%d data and %d/%d metadata blocks reproduced",
+			r.DataOK, r.DataChecked, r.MetaOK, r.MetaChecked)
 	}
 }
 

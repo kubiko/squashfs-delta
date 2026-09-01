@@ -73,6 +73,7 @@ const (
 	codecNone uint16 = 0
 	codecXZ   uint16 = 1
 	codecLZO  uint16 = 2
+	codecZSTD uint16 = 3
 )
 
 func sectionName(id uint16) string {
