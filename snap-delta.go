@@ -1885,196 +1885,270 @@ func (g *Group) Go(f func() error) {
 
 // --- Main ---
 
-func main() {
-	if len(os.Args) < 2 {
-		printUsageAndExit("Missing operation")
+// cli is every option the command line binds, together with the flag sets that
+// bind them.
+//
+// It exists so that the help text and the parser cannot drift apart. The help
+// used to be a hand-written list and had fallen a whole delta format behind: it
+// described --hdiffz and --xdelta3 and nothing else, with no sign of --blocks,
+// --stats, the cost-model flags or either development subcommand. Printing the
+// flag sets themselves means every option is documented by the same string the
+// parser registers it with, and a new one appears in the help without anybody
+// having to describe it twice.
+type cli struct {
+	generate *flag.FlagSet
+	apply    *flag.FlagSet
+	selftest *flag.FlagSet
+	inspect  *flag.FlagSet
+
+	genSource, genTarget, genDelta                  string
+	xdelta3Tool, hdiffzTool, blocksFormat           bool
+	genThreads, genMaxRun, genMinSaving             int
+	genNoVerify, genNoPatchRuns, genNoPathMatch     bool
+	genRunLog                                       bool
+	genWindowRatio, genMinSavingRate, genWindowBack float64
+
+	appSource, appTarget, appDelta string
+	appReport                      bool
+	appMaxRun                      int
+
+	stSample, stThreads int
+}
+
+// subcommand is one operation as the help prints it: what it is called, what it
+// takes after its options, and which flag set holds those options.
+type subcommand struct {
+	name  string
+	args  string
+	brief string
+	fs    *flag.FlagSet
+}
+
+// subcommands lists the operations in the order the help prints them, the two
+// that generate and apply deltas first and the two development ones after.
+func (c *cli) subcommands() []subcommand {
+	return []subcommand{
+		{"generate", "", "generate a delta between a source and a target snap", c.generate},
+		{"apply", "", "apply a delta to the source, reconstructing the target", c.apply},
+		{"selftest", "<image>...", "check that the local compressor reproduces an image's own blocks", c.selftest},
+		{"inspect", "<image>...", "dump the byte layout of one or more squashfs images", c.inspect},
+	}
+}
+
+func newCLI() *cli {
+	c := &cli{
+		generate: flag.NewFlagSet("generate", flag.ExitOnError),
+		apply:    flag.NewFlagSet("apply", flag.ExitOnError),
+		selftest: flag.NewFlagSet("selftest", flag.ExitOnError),
+		inspect:  flag.NewFlagSet("inspect", flag.ExitOnError),
 	}
 
-	// Setup subcommands
-	var genSource, genTarget, genDelta, appSource, appTarget, appDelta string
-	var xdelta3Tool, hdiffzTool, blocksFormat bool
-	var genThreads, genMaxRun, genMinSaving int
-	var genNoVerify, genNoPatchRuns, genNoPathMatch, genRunLog bool
-	var genWindowRatio, genMinSavingRate, genWindowBack float64
-	var appReport bool
-	var appMaxRun int
-	generateCmd := flag.NewFlagSet("generate", flag.ExitOnError)
-	generateCmd.StringVar(&genSource, "source", "", "source snap file (required)")
-	generateCmd.StringVar(&genSource, "s", "", "source snap file (required)")
-	generateCmd.StringVar(&genTarget, "target", "", "target snap file (required)")
-	generateCmd.StringVar(&genTarget, "t", "", "target snap file (required)")
-	generateCmd.StringVar(&genDelta, "delta", "", "delta output file (required)")
-	generateCmd.StringVar(&genDelta, "d", "", "delta output file (required)")
-	generateCmd.BoolVar(&xdelta3Tool, "xdelta3", false, "used complression tool")
-	generateCmd.BoolVar(&hdiffzTool, "hdiffz", false, "used complression tool")
-	generateCmd.BoolVar(&blocksFormat, "blocks", false, "generate a "+snapDeltaFormatBlocks+" delta, which the applier can assemble without recompressing unchanged blocks")
-	generateCmd.IntVar(&genThreads, "threads", 0, "xz thread count, at least 2 (0 = default)")
-	generateCmd.IntVar(&genMaxRun, "max-run", 0, "cap on the plaintext one patch run reconstructs, which bounds apply memory (0 = default)")
-	generateCmd.BoolVar(&genNoVerify, "no-verify", false, "skip running the applier over the finished delta (--blocks only)")
+	// The three file arguments are spelled long and short. The short forms
+	// are registered as separate flags, so they are described as shorthands
+	// rather than repeating the long form's text in the help.
+	c.generate.StringVar(&c.genSource, "source", "", "source snap file (required)")
+	c.generate.StringVar(&c.genSource, "s", "", "shorthand for -source")
+	c.generate.StringVar(&c.genTarget, "target", "", "target snap file (required)")
+	c.generate.StringVar(&c.genTarget, "t", "", "shorthand for -target")
+	c.generate.StringVar(&c.genDelta, "delta", "", "delta output file (required)")
+	c.generate.StringVar(&c.genDelta, "d", "", "shorthand for -delta")
+	c.generate.BoolVar(&c.blocksFormat, "blocks", false, "generate a "+snapDeltaFormatBlocks+" delta, which the applier can assemble without recompressing unchanged blocks")
+	c.generate.BoolVar(&c.hdiffzTool, "hdiffz", false, "generate a "+snapDeltaFormatHdiffz+" delta: hdiffz over a squashfs pseudo-file definition, one file at a time because the tool does not stream")
+	c.generate.BoolVar(&c.xdelta3Tool, "xdelta3", false, "generate a "+snapDeltaFormatXdelta3+" delta: xdelta3 over a squashfs pseudo-file definition")
+	c.generate.IntVar(&c.genThreads, "threads", 0, "xz thread count, at least 2 (0 = default)")
+	c.generate.IntVar(&c.genMaxRun, "max-run", 0, "cap on the plaintext one patch run reconstructs, which bounds apply memory (0 = default)")
+	c.generate.BoolVar(&c.genNoVerify, "no-verify", false, "skip running the applier over the finished delta (--blocks only)")
 	// The six that follow drive the cost model from the command line, which is
 	// how its defaults were measured; nothing but a sweep should pass them. The
 	// run log is how a sweep's result gets read: an aggregate report says what a
 	// delta cost, not which runs cost it.
-	generateCmd.BoolVar(&genNoPatchRuns, "no-patch-runs", false, "ship every changed block as a literal, asking the device for no data-block compression at all")
-	generateCmd.BoolVar(&genNoPathMatch, "no-path-match", false, "anchor patch runs by source offset alone, ignoring which file a block belongs to")
-	generateCmd.Float64Var(&genWindowRatio, "window-ratio", 0, "source window size as a multiple of a run's plaintext (0 = default)")
-	generateCmd.Float64Var(&genMinSavingRate, "min-saving-rate", 0, "delta bytes a run must save per byte of plaintext it makes the device compress (0 = default)")
-	generateCmd.IntVar(&genMinSaving, "min-saving", -1, "fewest delta bytes a run must save to be worth compressing for at all (-1 = default, 0 = no floor)")
-	generateCmd.Float64Var(&genWindowBack, "window-back", -1, "fraction of a source window placed before its anchor rather than after it (-1 = default)")
-	generateCmd.BoolVar(&genRunLog, "run-log", false, "print one line per patch run on stderr: its plaintext, its window and what the patch cost")
+	c.generate.BoolVar(&c.genNoPatchRuns, "no-patch-runs", false, "ship every changed block as a literal, asking the device for no data-block compression at all")
+	c.generate.BoolVar(&c.genNoPathMatch, "no-path-match", false, "anchor patch runs by source offset alone, ignoring which file a block belongs to")
+	c.generate.Float64Var(&c.genWindowRatio, "window-ratio", 0, "source window size as a multiple of a run's plaintext (0 = default)")
+	c.generate.Float64Var(&c.genMinSavingRate, "min-saving-rate", 0, "delta bytes a run must save per byte of plaintext it makes the device compress (0 = default)")
+	c.generate.IntVar(&c.genMinSaving, "min-saving", -1, "fewest delta bytes a run must save to be worth compressing for at all (-1 = default, 0 = no floor)")
+	c.generate.Float64Var(&c.genWindowBack, "window-back", -1, "fraction of a source window placed before its anchor rather than after it (-1 = default)")
+	c.generate.BoolVar(&c.genRunLog, "run-log", false, "print one line per patch run on stderr: its plaintext, its window and what the patch cost")
 
-	applyCmd := flag.NewFlagSet("apply", flag.ExitOnError)
-	applyCmd.BoolVar(&appReport, "stats", false, "report what the apply cost")
-	applyCmd.IntVar(&appMaxRun, "max-run", 0, "refuse a delta whose patch runs need more than this many bytes at once (0 = accept any)")
-	applyCmd.StringVar(&appSource, "source", "", "source snap file (required)")
-	applyCmd.StringVar(&appSource, "s", "", "source snap file (required)")
-	applyCmd.StringVar(&appTarget, "target", "", "target snap file (required)")
-	applyCmd.StringVar(&appTarget, "t", "", "target snap file (required)")
-	applyCmd.StringVar(&appDelta, "delta", "", "delta input file (required)")
-	applyCmd.StringVar(&appDelta, "d", "", "delta input file (required)")
-
-	// Custom usage for subcommands
-	generateCmd.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: go run snap-delta generate [options]")
-		generateCmd.PrintDefaults()
-	}
-	applyCmd.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: go run snap-delta apply [options]")
-		applyCmd.PrintDefaults()
-	}
+	c.apply.StringVar(&c.appSource, "source", "", "source snap file (required)")
+	c.apply.StringVar(&c.appSource, "s", "", "shorthand for -source")
+	c.apply.StringVar(&c.appTarget, "target", "", "reconstructed snap file to write (required)")
+	c.apply.StringVar(&c.appTarget, "t", "", "shorthand for -target")
+	c.apply.StringVar(&c.appDelta, "delta", "", "delta input file (required)")
+	c.apply.StringVar(&c.appDelta, "d", "", "shorthand for -delta")
+	c.apply.BoolVar(&c.appReport, "stats", false, "report what the apply cost: instructions, bytes copied and compressed, peak memory")
+	c.apply.IntVar(&c.appMaxRun, "max-run", 0, "refuse a delta whose patch runs need more than this many bytes at once (0 = accept any)")
 
 	// Development subcommands for the block-plan format: 'inspect' dumps an
-	// image's layout, 'selftest' is the gate that the local xz reproduces the
-	// image's own blocks byte for byte.
-	var stSample, stThreads int
-	selftestCmd := flag.NewFlagSet("selftest", flag.ExitOnError)
-	selftestCmd.IntVar(&stSample, "sample", 0, "check only this many data blocks, spread across the image (0 = all)")
-	selftestCmd.IntVar(&stThreads, "threads", 0, "xz thread count, at least 2 (0 = default)")
-	selftestCmd.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: snap-delta selftest [options] <image>...")
-		selftestCmd.PrintDefaults()
+	// image's layout, 'selftest' is the gate that the local compressor
+	// reproduces the image's own blocks byte for byte.
+	c.selftest.IntVar(&c.stSample, "sample", 0, "check only this many data blocks, spread across the image (0 = all)")
+	c.selftest.IntVar(&c.stThreads, "threads", 0, "xz thread count, at least 2 (0 = default)")
+
+	for _, s := range c.subcommands() {
+		s := s
+		s.fs.Usage = func() { c.printCommand(os.Stderr, s) }
 	}
-	inspectCmd := flag.NewFlagSet("inspect", flag.ExitOnError)
-	inspectCmd.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: snap-delta inspect <image>...")
+	return c
+}
+
+// hasOptions reports whether a subcommand binds any flags, which is what
+// decides whether its usage line mentions options at all.
+func (s subcommand) hasOptions() bool {
+	n := 0
+	s.fs.VisitAll(func(*flag.Flag) { n++ })
+	return n > 0
+}
+
+// usageLine is how a subcommand is invoked, without its option list.
+func (s subcommand) usageLine(appName string) string {
+	line := appName + " " + s.name
+	if s.hasOptions() {
+		line += " [options]"
+	}
+	if s.args != "" {
+		line += " " + s.args
+	}
+	return line
+}
+
+// printCommand prints one operation: how it is invoked and every option it
+// takes, straight out of the flag set that parses them.
+func (c *cli) printCommand(w io.Writer, s subcommand) {
+	fmt.Fprintf(w, "%s\n", s.usageLine(filepath.Base(os.Args[0])))
+	if s.hasOptions() {
+		s.fs.SetOutput(w)
+		s.fs.PrintDefaults()
+	}
+}
+
+// printUsage prints the whole help: what the tool is, the operations, and every
+// option of every operation.
+func (c *cli) printUsage(w io.Writer, msg string) {
+	appName := filepath.Base(os.Args[0])
+	if msg != "" {
+		fmt.Fprintln(w, msg)
+		fmt.Fprintln(w)
+	}
+	fmt.Fprintln(w, "Generate / apply 'smart' delta between source and target squashfs images.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintf(w, "\t%s <operation> [options]\n", appName)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Operations:")
+	for _, s := range c.subcommands() {
+		fmt.Fprintf(w, "\t%-9s %s\n", s.name, s.brief)
+	}
+	for _, s := range c.subcommands() {
+		fmt.Fprintln(w)
+		c.printCommand(w, s)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintf(w, "\t%s generate --blocks --source core22_2134.snap --target core22_2140.snap --delta core22-2134-2140.delta\n", appName)
+	fmt.Fprintf(w, "\t%s apply --stats --source core22_2134.snap --delta core22-2134-2140.delta --target rebuilt.snap\n", appName)
+	fmt.Fprintf(w, "\t%s selftest core22_2140.snap\n", appName)
+}
+
+// usageAndExit prints the help and stops. A request for it succeeds; a usage
+// error is a failure, and the two go to different streams so that piping the
+// help somewhere does not mix it with a complaint.
+func (c *cli) usageAndExit(msg string) {
+	if msg == "" {
+		c.printUsage(os.Stdout, "")
+		os.Exit(0)
+	}
+	c.printUsage(os.Stderr, msg)
+	os.Exit(1)
+}
+
+func main() {
+	c := newCLI()
+	if len(os.Args) < 2 {
+		c.usageAndExit("Missing operation")
 	}
 
 	var err error
 	switch os.Args[1] {
 	case "generate":
-		generateCmd.Parse(os.Args[2:])
-		if genSource == "" || genTarget == "" || genDelta == "" {
-			generateCmd.Usage()
+		c.generate.Parse(os.Args[2:])
+		if c.genSource == "" || c.genTarget == "" || c.genDelta == "" {
+			c.generate.Usage()
 			log.Fatal("Missing required parameters for 'generate'")
 		}
-		if blocksFormat {
-			err = cmdGenerateBlocks(context.Background(), genSource, genTarget, genDelta, genCmdOpts{
-				Threads:       genThreads,
-				MaxRun:        genMaxRun,
-				Verify:        !genNoVerify,
-				NoPatchRuns:   genNoPatchRuns,
-				NoPathMatch:   genNoPathMatch,
-				WindowRatio:   genWindowRatio,
-				MinSavingRate: genMinSavingRate,
-				MinSaving:     genMinSaving,
+		if c.blocksFormat {
+			err = cmdGenerateBlocks(context.Background(), c.genSource, c.genTarget, c.genDelta, genCmdOpts{
+				Threads:       c.genThreads,
+				MaxRun:        c.genMaxRun,
+				Verify:        !c.genNoVerify,
+				NoPatchRuns:   c.genNoPatchRuns,
+				NoPathMatch:   c.genNoPathMatch,
+				WindowRatio:   c.genWindowRatio,
+				MinSavingRate: c.genMinSavingRate,
+				MinSaving:     c.genMinSaving,
 
-				WindowBackFrac: genWindowBack,
-				RunLog:         genRunLog,
+				WindowBackFrac: c.genWindowBack,
+				RunLog:         c.genRunLog,
 			})
 			break
 		}
 		var deltaFormat DeltaFormat
-		if hdiffzTool {
+		if c.hdiffzTool {
 			deltaFormat = SnapHdiffzFormat
-		} else if xdelta3Tool {
+		} else if c.xdelta3Tool {
 			deltaFormat = SnapXdelta3Format
 		} else {
+			c.generate.Usage()
 			log.Fatal("missing delta tool setting for generate operation")
 		}
 		fmt.Printf("requested delta tool: 0x%X\n", deltaFormat)
-		err = GenerateDelta(genSource, genTarget, genDelta, deltaFormat)
+		err = GenerateDelta(c.genSource, c.genTarget, c.genDelta, deltaFormat)
 
 	case "apply":
-		applyCmd.Parse(os.Args[2:])
-		if appSource == "" || appTarget == "" || appDelta == "" {
-			applyCmd.Usage()
+		c.apply.Parse(os.Args[2:])
+		if c.appSource == "" || c.appTarget == "" || c.appDelta == "" {
+			c.apply.Usage()
 			log.Fatal("Missing required parameters for 'apply'")
 		}
-		if appReport {
+		if c.appReport {
 			// Reporting needs the block-plan applier's own numbers, so take
 			// that path directly rather than through the magic switch, which
 			// returns nothing.
 			var df *os.File
-			if df, err = os.Open(appDelta); err == nil {
+			if df, err = os.Open(c.appDelta); err == nil {
 				defer df.Close()
-				_, err = applyBlockPlanReport(context.Background(), appSource, df, appTarget,
-					blockPlanApplyOpts{MaxRunUSize: appMaxRun}, true)
+				_, err = applyBlockPlanReport(context.Background(), c.appSource, df, c.appTarget,
+					blockPlanApplyOpts{MaxRunUSize: c.appMaxRun}, true)
 			}
 			break
 		}
-		err = ApplyDelta(appSource, appDelta, appTarget)
+		err = ApplyDelta(c.appSource, c.appDelta, c.appTarget)
 
 	case "selftest":
-		selftestCmd.Parse(os.Args[2:])
-		if selftestCmd.NArg() == 0 {
-			selftestCmd.Usage()
+		c.selftest.Parse(os.Args[2:])
+		if c.selftest.NArg() == 0 {
+			c.selftest.Usage()
 			log.Fatal("Missing image arguments for 'selftest'")
 		}
-		err = cmdSelftest(context.Background(), selftestCmd.Args(), stSample, stThreads)
+		err = cmdSelftest(context.Background(), c.selftest.Args(), c.stSample, c.stThreads)
 
 	case "inspect":
-		inspectCmd.Parse(os.Args[2:])
-		if inspectCmd.NArg() == 0 {
-			inspectCmd.Usage()
+		c.inspect.Parse(os.Args[2:])
+		if c.inspect.NArg() == 0 {
+			c.inspect.Usage()
 			log.Fatal("Missing image arguments for 'inspect'")
 		}
-		err = cmdInspect(context.Background(), inspectCmd.Args())
+		err = cmdInspect(context.Background(), c.inspect.Args())
 
-	case "--help", "-h":
-		printUsageAndExit("")
+	case "--help", "-h", "help":
+		c.usageAndExit("")
 
 	default:
-		printUsageAndExit(fmt.Sprintf("Unrecognised operation: %s", os.Args[1]))
+		c.usageAndExit(fmt.Sprintf("Unrecognised operation: %s", os.Args[1]))
 	}
 
 	if err != nil {
 		log.Fatalf("Operation failed: %v", err)
 	}
 	fmt.Println("Operation completed successfully.")
-}
-
-// print help
-func printUsageAndExit(msg ...string) {
-	if len(msg) > 0 && msg[0] != "" {
-		fmt.Fprintln(os.Stderr, msg[0])
-		fmt.Fprintln(os.Stderr)
-	}
-	appName := filepath.Base(os.Args[0])
-	fmt.Fprintln(os.Stderr, "Generate / apply 'smart' delta between source and target squashfs images.")
-	fmt.Fprintln(os.Stderr, "Operations:")
-	fmt.Fprintln(os.Stderr, "\tgenerate: generate delta between source and target")
-	fmt.Fprintln(os.Stderr, "\tapply:    apply delta on the source")
-	fmt.Fprintln(os.Stderr, "\tinspect:  dump the byte layout of one or more squashfs images")
-	fmt.Fprintln(os.Stderr, "\tselftest: check that the local xz reproduces an image's own blocks")
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, "Compulsory arguments:")
-	fmt.Fprintln(os.Stderr, "\t--source | -s: source snap")
-	fmt.Fprintln(os.Stderr, "\t--target | -t: target snap")
-	fmt.Fprintln(os.Stderr, "\t--delta  | -d: delta between source and target snap")
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, "Optional arguments:")
-	fmt.Fprintln(os.Stderr, "\t--hdiffz:   use hdiffz(hpatchz) as delta tool to generate and apply delta on squashfs pseudo file definition")
-	fmt.Fprintln(os.Stderr, "\t            As this delta tool does not support streaming, pseudo file definition is processed per file within the stream.")
-	fmt.Fprintln(os.Stderr, "\t            !! only available during delta generation !!")
-	fmt.Fprintln(os.Stderr, "\t--xdelta3:  use xdelta3 as delta tool to generate and apply delta on squashfs pseudo file definition")
-	fmt.Fprintln(os.Stderr, "\t            !! only available during delta generation !!")
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintf(os.Stderr, "\t%s generate --hdiffz --source <SNAP>  --target <SNAP> --delta <DELTA>\n", appName)
-	fmt.Fprintf(os.Stderr, "\t%s apply             --source <SNAP>  --target <Snew NAP> --delta <DELTA>\n", appName)
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, "Example:")
-	fmt.Fprintf(os.Stderr, "\t%s generate --source core22_2134.snap --target core22_2140.snap --delta delta-core22-2134-2140.delta\n", appName)
-	fmt.Fprintf(os.Stderr, "\t%s apply    --source core22_2134.snap --target core22_2140.snap --delta delta-core22-2134-2140.delta\n", appName)
-	os.Exit(1)
 }
