@@ -120,6 +120,12 @@ type blockPlanGenOpts struct {
 	// Tuning replaces the whole patch-run cost model. Nil takes the defaults,
 	// which is what everything but the sweeps and the tests wants.
 	Tuning *patchRunTuning
+	// RunLog receives one line per patch run: how much plaintext it
+	// reconstructs, how much source it was given, what the patch cost and
+	// which anchor placed the window. The aggregate report says what the
+	// delta cost but not which runs cost it, and a run that diffs badly looks
+	// exactly like a run whose content genuinely changed.
+	RunLog io.Writer
 }
 
 // defaultMaxRunUSize sets what an apply demands in RAM, because a run's

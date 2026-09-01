@@ -99,6 +99,18 @@ const (
 	anchorFuzzy
 )
 
+// String names the anchor for the generator's report.
+func (k anchorKind) String() string {
+	switch k {
+	case anchorPath:
+		return "path"
+	case anchorFuzzy:
+		return "fuzzy"
+	default:
+		return "cursor"
+	}
+}
+
 // minFuzzySizeSimilarity is how close two files' plaintext sizes must be, as a
 // percentage of the larger, for a digits-only path difference to be believed.
 //

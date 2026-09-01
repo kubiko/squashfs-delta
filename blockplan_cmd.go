@@ -138,6 +138,9 @@ type genCmdOpts struct {
 	WindowRatio   float64
 	MinSavingRate float64
 	MinSaving     int
+	// RunLog asks for one line per patch run on stderr, which is how a bad
+	// run gets told apart from a run whose content really changed.
+	RunLog bool
 }
 
 // cmdGenerateBlocks generates a block-plan delta and reports its composition.
@@ -158,6 +161,10 @@ func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string
 		}
 		tune = &t
 	}
+	var runLog io.Writer
+	if o.RunLog {
+		runLog = os.Stderr
+	}
 	stats, err := generateBlockPlan(ctx, sourceSnap, targetSnap, delta, blockPlanGenOpts{
 		Comp:        &xzCLI{threads: o.Threads},
 		MaxRunUSize: o.MaxRun,
@@ -166,6 +173,7 @@ func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string
 		NoPatchRuns: o.NoPatchRuns,
 		NoPathMatch: o.NoPathMatch,
 		Tuning:      tune,
+		RunLog:      runLog,
 	})
 	if err != nil {
 		return err
