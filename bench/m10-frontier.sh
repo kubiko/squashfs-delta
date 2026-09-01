@@ -21,10 +21,15 @@ BIN=/home/ondrak/development/squashfs-delta/snap-delta-blocks
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
+# The reference column is the snap-1-1-Hdiffz delta size measured in
+# bench/m10-compare.sh for the same pair. post61->post60 is here because it is
+# the worst ratio of the seven: a near-empty revision where the shipped format
+# needs 252 KiB and this one needs 2.7 MiB, almost all of it literals.
 pairs=(
 	"$SC/snapcraft_8.13.2.post75_amd64.snap $SC/snapcraft_8.13.2.post77_amd64.snap 735386"
+	"$SC/snapcraft_9.0.0.post61_amd64.snap $SC/snapcraft_9.0.0.post60_amd64.snap 252447"
 	"$SC/snapcraft_8.13.2.post77_amd64.snap $SC/snapcraft_8.14.4.post129_amd64.snap 3886554"
-	"$KRN/imx-kernel_6.18.0-1013.13_arm64.snap $KRN/imx-kernel_6.18.0-1014.14_arm64.snap 0"
+	"$KRN/imx-kernel_6.18.0-1013.13_arm64.snap $KRN/imx-kernel_6.18.0-1014.14_arm64.snap 4242862"
 )
 
 for p in "${pairs[@]}"; do
@@ -42,7 +47,9 @@ for p in "${pairs[@]}"; do
 		line=$(echo "$out" | grep "apply compresses")
 		comp=$(echo "$line" | sed 's/.*compresses \(.*\) of .*/\1/')
 		avoid=$(echo "$line" | sed 's/.*(\(.*\) avoided).*/\1/')
-		lit=$(echo "$out" | sed -n 's/.*literal *\(.*\)$/\1/p' | head -1)
+		# Anchored at the start of the report's own "literal" line: the
+		# instructions line and the "runs as literal" line both contain the word.
+		lit=$(echo "$out" | sed -n 's/^  literal  *\(.*\)$/\1/p')
 		vs="-"
 		[ "$ref" != 0 ] && vs=$(awk -v a="$size" -v b="$ref" 'BEGIN{printf "%.2fx", a/b}')
 		printf "%10s %12s %8s %14s %10s %10s\n" "$floor" "$size" "$vs" "$comp" "$avoid" "$lit"
