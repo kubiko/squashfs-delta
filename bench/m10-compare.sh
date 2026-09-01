@@ -16,6 +16,27 @@
 # path anchoring frees on a smaller delta; -min-saving-rate 0.20 holds roughly the
 # CPU of the pre-anchor measurements instead. Which of the two should be the
 # default is exactly what these numbers are for.
+#
+# What they said, once the window picker stopped ending a window at the first raw
+# stretch and the saving floor came off (delta bytes, then apply CPU as user+sys,
+# then peak RSS over the process tree; snap-1-1-Hdiffz first, snap-2-1-blocks
+# second):
+#
+#   post75 -> post77       735,386 / 48.1s / 213.5M   544,423 / 11.5s / 14.4M
+#   post77 -> post129    3,886,554 / 50.9s / 213.3M 3,657,582 / 22.9s / 15.9M
+#   post129 -> post194   2,323,914 / 74.1s / 213.4M 2,095,623 / 18.7s / 14.5M
+#   post61 -> post60       252,447 / 72.1s / 219.2M   100,705 /  7.8s / 13.8M
+#   imx-kernel 1013->1014 4,242,862 / 27.7s / 117.1M 3,486,147 / 19.0s /  9.8M
+#   imx93 26-12 -> 26-13     1,155 /  0.9s /  30.5M     1,083 /  0.0s /  5.3M
+#   imx93 26-11 -> 26-12   658,794 /  0.9s /  29.9M   659,274 /  0.6s /  8.4M
+#
+# So the default cost model, not the CPU-holding one: it is smaller than the
+# shipped format on six of the seven pairs and within 480 bytes on the seventh,
+# while costing 1.5x to 9.2x less apply CPU and 12x to 16x less memory. Every
+# apply rebuilt its target byte for byte. -min-saving-rate 0.20 buys another 20-45%
+# off the CPU but pays 1.6-2.4x in delta size for it, which is a device-specific
+# trade rather than a default. The publisher pays for all of this: generation
+# takes roughly 1.5-2.5x the CPU of a whole-image hdiffz and 300-400 MiB of RSS.
 set -u
 
 SC=/home/ondrak/development/snapcraft
