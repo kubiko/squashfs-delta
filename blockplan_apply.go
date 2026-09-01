@@ -95,9 +95,10 @@ type blockPlanApplyOpts struct {
 	// told what compressed the image it is assembling; a non-nil one must agree
 	// with that superblock.
 	Comp Compressor
-	// Threads is a hint for the derived compressor, ignored by the in-process
-	// ones. Zero lets it decide.
-	Threads int
+	// Jobs is how many blocks the derived compressor may work on at once.
+	// Zero or less means every core. Raising it raises peak memory as well as
+	// speed, because every worker holds its own encoder state and buffers.
+	Jobs int
 	// HpatchzPath is the patch tool binary; empty means look it up.
 	HpatchzPath string
 	// MaxRunUSize is the largest patch run this applier is willing to accept.
@@ -187,7 +188,7 @@ func applyBlockPlan(ctx context.Context, src *os.File, delta io.Reader, out io.W
 	// cannot reproduce byte for byte is refused here, before the target is
 	// touched. An override is honoured only if it agrees with SEC_SB.
 	if opts.Comp == nil {
-		if opts.Comp, err = newCompressor(tsb.CompressionId, opts.Threads); err != nil {
+		if opts.Comp, err = newCompressor(tsb.CompressionId, opts.Jobs); err != nil {
 			return nil, err
 		}
 	} else if err := checkCompressorMatches(opts.Comp, tsb.CompressionId); err != nil {

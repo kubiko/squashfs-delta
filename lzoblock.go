@@ -152,8 +152,8 @@ import (
 // configuration that reaches this code is the default one.
 
 func init() {
-	compressorFactories[compressorLzo] = func(threads int) (Compressor, error) {
-		return newLZOCompressor()
+	compressorFactories[compressorLzo] = func(jobs int) (Compressor, error) {
+		return newLZOCompressor(jobs)
 	}
 	blobDecoders[codecLZO] = lzoDecompressBlob
 }
@@ -215,18 +215,58 @@ func lzoCompressBound(n int) int { return n + n/16 + 64 + 3 }
 // The four buffers are why one of these belongs to one goroutine at a time, as
 // Compressor documents: they are reused across every block of every call, which
 // keeps a whole-image generate from allocating per block.
-type lzoCompressor struct {
-	wrk  []byte // lzo1x_999 workspace
+// lzoWorker is the scratch one block's worth of work needs. The library
+// allocates nothing of its own -- the workspace is the caller's, and so are
+// both output buffers -- so a worker is the whole of what makes a compression
+// or a decompression call reentrant, and a pool of them is the whole of what
+// makes it parallel.
+type lzoWorker struct {
+	// wrk is the lzo1x_999 workspace, allocated on first use rather than with
+	// the worker: it is 448 KiB and decompression has no use for it, so a pool
+	// serving an applier that mostly reads would otherwise pay for it per job.
+	wrk  []byte
 	cbuf []byte // compressed output
 	ref  []byte // lzo1x_optimize reference buffer
 	ubuf []byte // decompressed output
+	src  []byte // a copy of one block's plaintext, taken under the pool's lock
 }
 
-func newLZOCompressor() (*lzoCompressor, error) {
+type lzoCompressor struct {
+	// jobs is how many blocks may be worked on at once. Each one costs a
+	// worker, and a worker costs its 448 KiB workspace plus a block-sized
+	// buffer or three, which is the memory the job count buys speed with.
+	jobs int
+	// workers are created on demand rather than up front: the blob and
+	// metadata paths compress one small thing at a time and never need more
+	// than the first.
+	workers []*lzoWorker
+	// plainMu serialises BlockPlain access, whose contract is one call at a
+	// time into a reused buffer. Workers copy the block they are given and
+	// then leave the lock, so the parallel part is the compression.
+	plainMu sync.Mutex
+}
+
+func newLZOCompressor(jobs int) (*lzoCompressor, error) {
 	if _, err := loadLZO(); err != nil {
 		return nil, err
 	}
-	return &lzoCompressor{wrk: make([]byte, lzoWorkspaceSize)}, nil
+	return &lzoCompressor{jobs: resolveJobs(jobs)}, nil
+}
+
+// ensureWorkers creates the scratch for a batch of n blocks. It is called
+// before the batch is handed out, never from inside it: the pool is a plain
+// slice, and growing it from a goroutine that is already working would be a
+// data race on the very thing that makes the work safe to parallelise.
+func (l *lzoCompressor) ensureWorkers(n int) {
+	for len(l.workers) < n {
+		l.workers = append(l.workers, &lzoWorker{})
+	}
+}
+
+// worker returns the scratch for one position in a batch.
+func (l *lzoCompressor) worker(j int) *lzoWorker {
+	l.ensureWorkers(j + 1)
+	return l.workers[j]
 }
 
 func (l *lzoCompressor) ID() uint16 { return compressorLzo }
@@ -257,14 +297,15 @@ func grow(buf *[]byte, n int) []byte {
 // form is no smaller than its plaintext goes into the image verbatim. The
 // wrapper's own refusal -- output longer than the block size -- is subsumed by
 // it, since a block is never longer than the block size.
-func (l *lzoCompressor) compressBlock(src []byte) (onDisk []byte, raw bool, err error) {
+func (l *lzoWorker) compressBlock(src []byte) (onDisk []byte, raw bool, err error) {
 	dst := grow(&l.cbuf, lzoCompressBound(len(src)))
 	ref := grow(&l.ref, len(src))
+	wrk := grow(&l.wrk, lzoWorkspaceSize)
 	var compLen, lzoErr C.int
 	st := C.sqd_lzo_compress(
 		(*C.uchar)(unsafe.Pointer(&src[0])), C.int(len(src)),
 		(*C.uchar)(unsafe.Pointer(&dst[0])), C.int(len(dst)),
-		(*C.uchar)(unsafe.Pointer(&ref[0])), unsafe.Pointer(&l.wrk[0]),
+		(*C.uchar)(unsafe.Pointer(&ref[0])), unsafe.Pointer(&wrk[0]),
 		&compLen, &lzoErr)
 	switch st {
 	case C.SQD_LZO_OK:
@@ -307,30 +348,66 @@ func (l *lzoCompressor) CompressBlocks(ctx context.Context, plain BlockPlain, uS
 	// has no dictionary and no window parameter, so a metadata block and a data
 	// block of the same content compress to the same bytes. The parameter stays
 	// in the interface because xz needs it.
+	offs := make([]int, len(uSizes))
 	off := 0
 	for i, u := range uSizes {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		src, err := plain.Block(off, u)
-		if err != nil {
-			return err
-		}
-		onDisk, raw, err := l.compressBlock(src)
-		if err != nil {
-			return fmt.Errorf("block %d: %w", i, err)
-		}
-		if err := fn(i, CompressedBlock{OnDisk: onDisk, Raw: raw, USize: u}); err != nil {
-			return err
-		}
+		offs[i] = off
 		off += u
+	}
+	// One batch of blocks is compressed at a time, then reported in order.
+	// The batch is what bounds the extra memory to the job count: a block's
+	// on-disk bytes are valid only until fn returns, so a whole batch's output
+	// is held at once, and nothing beyond it ever is.
+	type done struct {
+		onDisk []byte
+		raw    bool
+	}
+	batch := min(l.jobs, len(uSizes))
+	out := make([]done, batch)
+	for base := 0; base < len(uSizes); base += batch {
+		n := min(batch, len(uSizes)-base)
+		l.ensureWorkers(n)
+		err := runParallel(ctx, n, n, func(j int) error {
+			w := l.workers[j]
+			i := base + j
+			// BlockPlain hands out one block at a time into a buffer it
+			// reuses, so the read is serialised and the block copied; what
+			// runs in parallel is the compression, which is the expensive
+			// part by three orders of magnitude.
+			l.plainMu.Lock()
+			b, err := plain.Block(offs[i], uSizes[i])
+			var src []byte
+			if err == nil {
+				src = grow(&w.src, uSizes[i])
+				copy(src, b)
+			}
+			l.plainMu.Unlock()
+			if err != nil {
+				return err
+			}
+			onDisk, raw, err := w.compressBlock(src)
+			if err != nil {
+				return fmt.Errorf("block %d: %w", i, err)
+			}
+			out[j] = done{onDisk: onDisk, raw: raw}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for j := 0; j < n; j++ {
+			i := base + j
+			if err := fn(i, CompressedBlock{OnDisk: out[j].onDisk, Raw: out[j].raw, USize: uSizes[i]}); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
 // decompressBlock decompresses one block into scratch, returning the plaintext.
 // It is valid until the next call.
-func (l *lzoCompressor) decompressBlock(src []byte, maxUSize int) ([]byte, error) {
+func (l *lzoWorker) decompressBlock(src []byte, maxUSize int) ([]byte, error) {
 	if len(src) == 0 {
 		return nil, fmt.Errorf("empty compressed block")
 	}
@@ -356,26 +433,43 @@ func (l *lzoCompressor) DecompressBlocks(ctx context.Context, dst, src []byte, c
 		}
 		return dst, nil, nil
 	}
-	uSizes := make([]int, 0, len(cSizes))
+	offs := make([]int, len(cSizes))
 	off := 0
 	for i, c := range cSizes {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
 		if c <= 0 || off+c > len(src) {
 			return nil, nil, fmt.Errorf("block %d claims %d bytes with %d of %d left",
 				i, c, len(src)-off, len(src))
 		}
-		plain, err := l.decompressBlock(src[off:off+c], maxUSize)
-		if err != nil {
-			return nil, nil, fmt.Errorf("block %d: %w", i, err)
-		}
-		dst = append(dst, plain...)
-		uSizes = append(uSizes, len(plain))
+		offs[i] = off
 		off += c
 	}
 	if off != len(src) {
 		return nil, nil, fmt.Errorf("%d bytes follow the last of %d blocks", len(src)-off, len(cSizes))
+	}
+	// A batch at a time, for the reason CompressBlocks batches: each block's
+	// plaintext lives in its worker's buffer until it has been appended.
+	uSizes := make([]int, 0, len(cSizes))
+	batch := min(l.jobs, len(cSizes))
+	out := make([][]byte, batch)
+	for base := 0; base < len(cSizes); base += batch {
+		n := min(batch, len(cSizes)-base)
+		l.ensureWorkers(n)
+		err := runParallel(ctx, n, n, func(j int) error {
+			i := base + j
+			plain, err := l.workers[j].decompressBlock(src[offs[i]:offs[i]+cSizes[i]], maxUSize)
+			if err != nil {
+				return fmt.Errorf("block %d: %w", i, err)
+			}
+			out[j] = plain
+			return nil
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		for j := 0; j < n; j++ {
+			dst = append(dst, out[j]...)
+			uSizes = append(uSizes, len(out[j]))
+		}
 	}
 	return dst, uSizes, nil
 }
@@ -387,27 +481,47 @@ func (l *lzoCompressor) DecompressTo(ctx context.Context, w io.Writer, r io.Read
 	if len(cSizes) == 0 {
 		return 0, fmt.Errorf("lzo needs each block's size to decompress a run")
 	}
+	// r is a stream, so the reads stay in order and only the decompression
+	// fans out: a batch is read block by block into its workers' buffers,
+	// decompressed in parallel, and written in order.
 	var written int64
-	var stored []byte
-	for i, c := range cSizes {
+	batch := min(l.jobs, len(cSizes))
+	out := make([][]byte, batch)
+	for base := 0; base < len(cSizes); base += batch {
 		if err := ctx.Err(); err != nil {
 			return written, err
 		}
-		if c <= 0 {
-			return written, fmt.Errorf("block %d claims %d bytes", i, c)
+		n := min(batch, len(cSizes)-base)
+		l.ensureWorkers(n)
+		for j := 0; j < n; j++ {
+			i := base + j
+			c := cSizes[i]
+			if c <= 0 {
+				return written, fmt.Errorf("block %d claims %d bytes", i, c)
+			}
+			stored := grow(&l.workers[j].src, c)
+			if _, err := io.ReadFull(r, stored); err != nil {
+				return written, fmt.Errorf("reading block %d of %d bytes: %w", i, c, err)
+			}
 		}
-		stored = grow(&stored, c)
-		if _, err := io.ReadFull(r, stored); err != nil {
-			return written, fmt.Errorf("reading block %d of %d bytes: %w", i, c, err)
-		}
-		plain, err := l.decompressBlock(stored, maxUSize)
-		if err != nil {
-			return written, fmt.Errorf("block %d: %w", i, err)
-		}
-		n, err := w.Write(plain)
-		written += int64(n)
+		err := runParallel(ctx, n, n, func(j int) error {
+			wk := l.workers[j]
+			plain, err := wk.decompressBlock(wk.src[:cSizes[base+j]], maxUSize)
+			if err != nil {
+				return fmt.Errorf("block %d: %w", base+j, err)
+			}
+			out[j] = plain
+			return nil
+		})
 		if err != nil {
 			return written, err
+		}
+		for j := 0; j < n; j++ {
+			nw, err := w.Write(out[j])
+			written += int64(nw)
+			if err != nil {
+				return written, err
+			}
 		}
 	}
 	if wantLen >= 0 && written != int64(wantLen) {
@@ -427,7 +541,7 @@ func (l *lzoCompressor) CompressBlob(ctx context.Context, raw []byte) ([]byte, e
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("nothing to compress")
 	}
-	onDisk, isRaw, err := l.compressBlock(raw)
+	onDisk, isRaw, err := l.worker(0).compressBlock(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -443,14 +557,15 @@ func (l *lzoCompressor) CompressBlob(ctx context.Context, raw []byte) ([]byte, e
 // codecLZO to. It loads the library itself, because a section is decoded before
 // the delta's superblock has been parsed and so before any compressor exists.
 func lzoDecompressBlob(ctx context.Context, stored []byte, rawLen int) ([]byte, error) {
-	l, err := newLZOCompressor()
+	// One worker: a section is one blob, decompressed once.
+	l, err := newLZOCompressor(1)
 	if err != nil {
 		return nil, err
 	}
 	if rawLen <= 0 {
 		return nil, fmt.Errorf("section declares %d raw bytes", rawLen)
 	}
-	plain, err := l.decompressBlock(stored, rawLen)
+	plain, err := l.worker(0).decompressBlock(stored, rawLen)
 	if err != nil {
 		return nil, err
 	}

@@ -143,8 +143,8 @@ import (
 // is true, like lzo.
 
 func init() {
-	compressorFactories[compressorZstd] = func(threads int) (Compressor, error) {
-		return newZstdCompressor()
+	compressorFactories[compressorZstd] = func(jobs int) (Compressor, error) {
+		return newZstdCompressor(jobs)
 	}
 	blobDecoders[codecZSTD] = zstdDecompressBlob
 }
@@ -202,51 +202,98 @@ func loadZstd() (string, error) {
 // allocate and free their own working state, which at level 15 is megabytes per
 // block. They are reset by every call, so reusing them does not change a byte of
 // output.
-type zstdCompressor struct {
+// zstdWorker is one block's worth of working state: a compression context, a
+// decompression context and the two buffers they write into. The contexts are
+// what make a run cheap and are also what stops one from serving two blocks at
+// once, so a worker is the unit the job count multiplies.
+type zstdWorker struct {
 	cctx unsafe.Pointer
 	dctx unsafe.Pointer
 	cbuf []byte // compressed output
 	ubuf []byte // decompressed output
+	src  []byte // a copy of one block's plaintext, taken under the pool's lock
 }
 
-func newZstdCompressor() (*zstdCompressor, error) {
+type zstdCompressor struct {
+	// jobs is how many blocks may be worked on at once. Each costs a worker,
+	// and a worker costs a pair of library contexts -- megabytes at level 15 --
+	// plus its buffers, which is the memory the job count buys speed with.
+	jobs int
+	// workers are created on demand: the blob and metadata paths compress one
+	// small thing at a time and never need more than the first.
+	workers []*zstdWorker
+	// plainMu serialises BlockPlain access, whose contract is one call at a
+	// time into a reused buffer. Workers copy the block they are given and
+	// then leave the lock, so the parallel part is the compression.
+	plainMu sync.Mutex
+}
+
+func newZstdCompressor(jobs int) (*zstdCompressor, error) {
 	if _, err := loadZstd(); err != nil {
 		return nil, err
 	}
-	z := &zstdCompressor{
+	return &zstdCompressor{jobs: resolveJobs(jobs)}, nil
+}
+
+// newZstdWorker allocates one worker's contexts.
+func newZstdWorker() (*zstdWorker, error) {
+	w := &zstdWorker{
 		cctx: C.sqd_zstd_cctx_new(),
 		dctx: C.sqd_zstd_dctx_new(),
 	}
-	if z.cctx == nil || z.dctx == nil {
-		z.free()
+	if w.cctx == nil || w.dctx == nil {
+		w.free()
 		return nil, fmt.Errorf("zstd could not allocate its compression contexts")
 	}
 	// The contexts are library allocations, so they outlive Go's reach: a
-	// cleanup frees them when the compressor becomes unreachable. There is no
+	// cleanup frees them when the worker becomes unreachable. There is no
 	// Close in the Compressor interface because only the two library-backed
 	// implementations have anything to close, and a generate holds one
 	// compressor for the whole run.
-	runtime.AddCleanup(z, func(ctxs [2]unsafe.Pointer) {
+	runtime.AddCleanup(w, func(ctxs [2]unsafe.Pointer) {
 		if ctxs[0] != nil {
 			C.sqd_zstd_cctx_free(ctxs[0])
 		}
 		if ctxs[1] != nil {
 			C.sqd_zstd_dctx_free(ctxs[1])
 		}
-	}, [2]unsafe.Pointer{z.cctx, z.dctx})
-	return z, nil
+	}, [2]unsafe.Pointer{w.cctx, w.dctx})
+	return w, nil
 }
 
 // free releases the contexts on the one path that has no cleanup registered yet.
-func (z *zstdCompressor) free() {
-	if z.cctx != nil {
-		C.sqd_zstd_cctx_free(z.cctx)
-		z.cctx = nil
+func (w *zstdWorker) free() {
+	if w.cctx != nil {
+		C.sqd_zstd_cctx_free(w.cctx)
+		w.cctx = nil
 	}
-	if z.dctx != nil {
-		C.sqd_zstd_dctx_free(z.dctx)
-		z.dctx = nil
+	if w.dctx != nil {
+		C.sqd_zstd_dctx_free(w.dctx)
+		w.dctx = nil
 	}
+}
+
+// ensureWorkers creates the contexts for a batch of n blocks. It is called
+// before the batch is handed out, never from inside it: the pool is a plain
+// slice, and growing it from a goroutine that is already working would be a
+// data race on the very thing that makes the work safe to parallelise.
+func (z *zstdCompressor) ensureWorkers(n int) error {
+	for len(z.workers) < n {
+		w, err := newZstdWorker()
+		if err != nil {
+			return err
+		}
+		z.workers = append(z.workers, w)
+	}
+	return nil
+}
+
+// worker returns the state for one position in a batch.
+func (z *zstdCompressor) worker(j int) (*zstdWorker, error) {
+	if err := z.ensureWorkers(j + 1); err != nil {
+		return nil, err
+	}
+	return z.workers[j], nil
 }
 
 func (z *zstdCompressor) ID() uint16 { return compressorZstd }
@@ -266,13 +313,13 @@ func (z *zstdCompressor) SectionCodec() uint16 { return codecZSTD }
 // dstCap is the block size the image was built with, not the compressed bound,
 // because that is the capacity zstd_wrapper.c passes and the raw-store decision
 // depends on it.
-func (z *zstdCompressor) compressBlock(src []byte, dstCap int) (onDisk []byte, raw bool, err error) {
+func (w *zstdWorker) compressBlock(src []byte, dstCap int) (onDisk []byte, raw bool, err error) {
 	if dstCap <= 0 {
 		return nil, false, fmt.Errorf("block size %d is not a destination capacity", dstCap)
 	}
-	dst := grow(&z.cbuf, dstCap)
+	dst := grow(&w.cbuf, dstCap)
 	var errName *C.char
-	n := int(C.sqd_zstd_compress(z.cctx,
+	n := int(C.sqd_zstd_compress(w.cctx,
 		(*C.uchar)(unsafe.Pointer(&src[0])), C.int(len(src)),
 		(*C.uchar)(unsafe.Pointer(&dst[0])), C.int(dstCap),
 		C.int(zstdBlockLevel), &errName))
@@ -304,36 +351,74 @@ func (z *zstdCompressor) CompressBlocks(ctx context.Context, plain BlockPlain, u
 	if total != plain.Len() {
 		return fmt.Errorf("block sizes sum to %d but %d bytes of plaintext were given", total, plain.Len())
 	}
+	offs := make([]int, len(uSizes))
 	off := 0
 	for i, u := range uSizes {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		src, err := plain.Block(off, u)
-		if err != nil {
-			return err
-		}
-		onDisk, raw, err := z.compressBlock(src, dictSize)
-		if err != nil {
-			return fmt.Errorf("block %d: %w", i, err)
-		}
-		if err := fn(i, CompressedBlock{OnDisk: onDisk, Raw: raw, USize: u}); err != nil {
-			return err
-		}
+		offs[i] = off
 		off += u
+	}
+	// One batch of blocks is compressed at a time, then reported in order.
+	// The batch is what bounds the extra memory to the job count: a block's
+	// on-disk bytes are valid only until fn returns, so a whole batch's output
+	// is held at once, and nothing beyond it ever is.
+	type done struct {
+		onDisk []byte
+		raw    bool
+	}
+	batch := min(z.jobs, len(uSizes))
+	out := make([]done, batch)
+	for base := 0; base < len(uSizes); base += batch {
+		n := min(batch, len(uSizes)-base)
+		if err := z.ensureWorkers(n); err != nil {
+			return err
+		}
+		err := runParallel(ctx, n, n, func(j int) error {
+			w := z.workers[j]
+			i := base + j
+			// BlockPlain hands out one block at a time into a buffer it
+			// reuses, so the read is serialised and the block copied; what
+			// runs in parallel is the compression, which at level 15 is the
+			// expensive part by three orders of magnitude.
+			z.plainMu.Lock()
+			b, err := plain.Block(offs[i], uSizes[i])
+			var src []byte
+			if err == nil {
+				src = grow(&w.src, uSizes[i])
+				copy(src, b)
+			}
+			z.plainMu.Unlock()
+			if err != nil {
+				return err
+			}
+			onDisk, raw, err := w.compressBlock(src, dictSize)
+			if err != nil {
+				return fmt.Errorf("block %d: %w", i, err)
+			}
+			out[j] = done{onDisk: onDisk, raw: raw}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for j := 0; j < n; j++ {
+			i := base + j
+			if err := fn(i, CompressedBlock{OnDisk: out[j].onDisk, Raw: out[j].raw, USize: uSizes[i]}); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
 // decompressBlock decompresses one block into scratch, returning the plaintext.
 // It is valid until the next call.
-func (z *zstdCompressor) decompressBlock(src []byte, maxUSize int) ([]byte, error) {
+func (w *zstdWorker) decompressBlock(src []byte, maxUSize int) ([]byte, error) {
 	if len(src) == 0 {
 		return nil, fmt.Errorf("empty compressed block")
 	}
-	dst := grow(&z.ubuf, maxUSize)
+	dst := grow(&w.ubuf, maxUSize)
 	var errName *C.char
-	n := int(C.sqd_zstd_decompress(z.dctx,
+	n := int(C.sqd_zstd_decompress(w.dctx,
 		(*C.uchar)(unsafe.Pointer(&src[0])), C.int(len(src)),
 		(*C.uchar)(unsafe.Pointer(&dst[0])), C.int(maxUSize), &errName))
 	if n < 0 {
@@ -352,26 +437,45 @@ func (z *zstdCompressor) DecompressBlocks(ctx context.Context, dst, src []byte, 
 		}
 		return dst, nil, nil
 	}
-	uSizes := make([]int, 0, len(cSizes))
+	offs := make([]int, len(cSizes))
 	off := 0
 	for i, c := range cSizes {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
 		if c <= 0 || off+c > len(src) {
 			return nil, nil, fmt.Errorf("block %d claims %d bytes with %d of %d left",
 				i, c, len(src)-off, len(src))
 		}
-		plain, err := z.decompressBlock(src[off:off+c], maxUSize)
-		if err != nil {
-			return nil, nil, fmt.Errorf("block %d: %w", i, err)
-		}
-		dst = append(dst, plain...)
-		uSizes = append(uSizes, len(plain))
+		offs[i] = off
 		off += c
 	}
 	if off != len(src) {
 		return nil, nil, fmt.Errorf("%d bytes follow the last of %d blocks", len(src)-off, len(cSizes))
+	}
+	// A batch at a time, for the reason CompressBlocks batches: each block's
+	// plaintext lives in its worker's buffer until it has been appended.
+	uSizes := make([]int, 0, len(cSizes))
+	batch := min(z.jobs, len(cSizes))
+	out := make([][]byte, batch)
+	for base := 0; base < len(cSizes); base += batch {
+		n := min(batch, len(cSizes)-base)
+		if err := z.ensureWorkers(n); err != nil {
+			return nil, nil, err
+		}
+		err := runParallel(ctx, n, n, func(j int) error {
+			i := base + j
+			plain, err := z.workers[j].decompressBlock(src[offs[i]:offs[i]+cSizes[i]], maxUSize)
+			if err != nil {
+				return fmt.Errorf("block %d: %w", i, err)
+			}
+			out[j] = plain
+			return nil
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		for j := 0; j < n; j++ {
+			dst = append(dst, out[j]...)
+			uSizes = append(uSizes, len(out[j]))
+		}
 	}
 	return dst, uSizes, nil
 }
@@ -382,27 +486,49 @@ func (z *zstdCompressor) DecompressTo(ctx context.Context, w io.Writer, r io.Rea
 	if len(cSizes) == 0 {
 		return 0, fmt.Errorf("zstd needs each block's size to decompress a run")
 	}
+	// r is a stream, so the reads stay in order and only the decompression
+	// fans out: a batch is read block by block into its workers' buffers,
+	// decompressed in parallel, and written in order.
 	var written int64
-	var stored []byte
-	for i, c := range cSizes {
+	batch := min(z.jobs, len(cSizes))
+	out := make([][]byte, batch)
+	for base := 0; base < len(cSizes); base += batch {
 		if err := ctx.Err(); err != nil {
 			return written, err
 		}
-		if c <= 0 {
-			return written, fmt.Errorf("block %d claims %d bytes", i, c)
+		n := min(batch, len(cSizes)-base)
+		if err := z.ensureWorkers(n); err != nil {
+			return written, err
 		}
-		stored = grow(&stored, c)
-		if _, err := io.ReadFull(r, stored); err != nil {
-			return written, fmt.Errorf("reading block %d of %d bytes: %w", i, c, err)
+		for j := 0; j < n; j++ {
+			i := base + j
+			c := cSizes[i]
+			if c <= 0 {
+				return written, fmt.Errorf("block %d claims %d bytes", i, c)
+			}
+			stored := grow(&z.workers[j].src, c)
+			if _, err := io.ReadFull(r, stored); err != nil {
+				return written, fmt.Errorf("reading block %d of %d bytes: %w", i, c, err)
+			}
 		}
-		plain, err := z.decompressBlock(stored, maxUSize)
-		if err != nil {
-			return written, fmt.Errorf("block %d: %w", i, err)
-		}
-		n, err := w.Write(plain)
-		written += int64(n)
+		err := runParallel(ctx, n, n, func(j int) error {
+			wk := z.workers[j]
+			plain, err := wk.decompressBlock(wk.src[:cSizes[base+j]], maxUSize)
+			if err != nil {
+				return fmt.Errorf("block %d: %w", base+j, err)
+			}
+			out[j] = plain
+			return nil
+		})
 		if err != nil {
 			return written, err
+		}
+		for j := 0; j < n; j++ {
+			nw, err := w.Write(out[j])
+			written += int64(nw)
+			if err != nil {
+				return written, err
+			}
 		}
 	}
 	if wantLen >= 0 && written != int64(wantLen) {
@@ -423,9 +549,13 @@ func (z *zstdCompressor) CompressBlob(ctx context.Context, raw []byte) ([]byte, 
 	if bound <= 0 {
 		return nil, fmt.Errorf("ZSTD_compressBound reported %d for %d bytes", bound, len(raw))
 	}
+	w, err := z.worker(0)
+	if err != nil {
+		return nil, err
+	}
 	dst := make([]byte, bound)
 	var errName *C.char
-	n := int(C.sqd_zstd_compress(z.cctx,
+	n := int(C.sqd_zstd_compress(w.cctx,
 		(*C.uchar)(unsafe.Pointer(&raw[0])), C.int(len(raw)),
 		(*C.uchar)(unsafe.Pointer(&dst[0])), C.int(bound),
 		C.int(zstdBlobLevel), &errName))
@@ -440,14 +570,19 @@ func (z *zstdCompressor) CompressBlob(ctx context.Context, raw []byte) ([]byte, 
 // codecZSTD to. It loads the library itself, for the reason lzoDecompressBlob
 // does: a section is decoded before the delta's superblock has been parsed.
 func zstdDecompressBlob(ctx context.Context, stored []byte, rawLen int) ([]byte, error) {
-	z, err := newZstdCompressor()
+	// One worker: a section is one blob, decompressed once.
+	z, err := newZstdCompressor(1)
 	if err != nil {
 		return nil, err
 	}
 	if rawLen <= 0 {
 		return nil, fmt.Errorf("section declares %d raw bytes", rawLen)
 	}
-	plain, err := z.decompressBlock(stored, rawLen)
+	w, err := z.worker(0)
+	if err != nil {
+		return nil, err
+	}
+	plain, err := w.decompressBlock(stored, rawLen)
 	if err != nil {
 		return nil, err
 	}

@@ -22,8 +22,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // This file is the seam between the delta format and whichever compressor built
@@ -46,8 +48,10 @@ import (
 // Compressor reproduces one squashfs compressor, in both directions.
 //
 // Implementations are per-delta values, not shared singletons: an lzo or zstd
-// compressor owns library scratch state, and one Compressor is used from one
-// goroutine at a time.
+// compressor owns library scratch state, and one Compressor is used by one
+// caller at a time. A call may still spread its own blocks over several
+// goroutines -- that is what the job count buys -- but the scratch each of
+// those needs is the implementation's business, not the caller's.
 type Compressor interface {
 	Decompressor
 
@@ -223,8 +227,8 @@ func (p *plainFile) Stream() (io.Reader, error) {
 // to a compressor no snap in the store uses. Entries beyond xz are added by
 // files that need cgo, so a build without it refuses lzo and zstd images
 // rather than mis-assembling them.
-var compressorFactories = map[uint16]func(threads int) (Compressor, error){
-	compressorXz: func(threads int) (Compressor, error) { return &xzCLI{threads: threads}, nil },
+var compressorFactories = map[uint16]func(jobs int) (Compressor, error){
+	compressorXz: func(jobs int) (Compressor, error) { return &xzCLI{jobs: jobs}, nil },
 }
 
 // compressorNames are for messages only, and cover ids this format does not
@@ -264,20 +268,124 @@ func implementedCompressors() string {
 	return strings.Join(names, ", ")
 }
 
-// newCompressor builds the compressor for a squashfs compressor id. threads is
-// a hint for implementations that can use more than one; the in-process ones
-// ignore it.
+// newCompressor builds the compressor for a squashfs compressor id. jobs is how
+// many blocks it may work on at once; zero or less means every core.
 //
 // A failure here is a clean refusal at the front of a generate or an apply,
 // which is the point of doing it up front: a library that cannot be loaded is
 // found before any image work rather than partway through assembling a target.
-func newCompressor(id uint16, threads int) (Compressor, error) {
+func newCompressor(id uint16, jobs int) (Compressor, error) {
 	mk, ok := compressorFactories[id]
 	if !ok {
 		return nil, fmt.Errorf("unsupported compressor %s, this build implements %s",
 			compressorName(id), implementedCompressors())
 	}
-	return mk(threads)
+	return mk(jobs)
+}
+
+// --- parallelism ---
+//
+// Squashfs blocks are compressed independently of one another, which is the
+// property this whole format is built on -- and it makes every compressor's
+// inner loop embarrassingly parallel. Nothing about the output depends on how
+// the work is divided: block i produces the same bytes whichever core it lands
+// on, and the results are consumed in index order regardless.
+//
+// What parallelism does cost is memory. Each worker holds its own encoder
+// state and its own block-sized buffers, so raising the job count raises the
+// resident set roughly in proportion. That is the trade the --jobs flag makes,
+// and it is why the default is the machine's core count rather than something
+// unbounded.
+
+// resolveJobs turns a jobs setting into a concrete worker count. Zero or less
+// is the default and means every core, which is what a build machine wants; a
+// device that must stay within a memory budget passes an explicit number.
+func resolveJobs(jobs int) int {
+	if jobs > 0 {
+		return jobs
+	}
+	return runtime.NumCPU()
+}
+
+// runParallel calls work(i) for every i in [0,n), spreading them over jobs
+// goroutines.
+//
+// Callers pass one batch of at most jobs indices at a time and key their
+// scratch on i, which is what makes the work reentrant: within a batch no
+// index is handed out twice, so a buffer belonging to index i has exactly one
+// goroutine touching it, and the batch ends before the next one reuses it.
+//
+// It returns the first error any call reported and stops handing out further
+// indices, but it always waits for the calls already running: their scratch is
+// the caller's, and returning while a goroutine still holds it would hand the
+// caller a buffer being written from underneath it.
+func runParallel(ctx context.Context, jobs, n int, work func(i int) error) error {
+	if n <= 0 {
+		return nil
+	}
+	if jobs > n {
+		jobs = n
+	}
+	if jobs <= 1 {
+		for i := 0; i < n; i++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := work(i); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	var (
+		mu    sync.Mutex
+		next  int
+		first error
+		wg    sync.WaitGroup
+	)
+	// take hands out the next index, or reports that there is nothing left to
+	// do -- either because the work is done or because something failed.
+	take := func() (int, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if first != nil || next >= n {
+			return 0, false
+		}
+		i := next
+		next++
+		return i, true
+	}
+	fail := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if first == nil {
+			first = err
+		}
+	}
+
+	wg.Add(jobs)
+	for range jobs {
+		go func() {
+			defer wg.Done()
+			for {
+				i, ok := take()
+				if !ok {
+					return
+				}
+				if err := ctx.Err(); err != nil {
+					fail(err)
+					return
+				}
+				if err := work(i); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return first
 }
 
 // checkCompressorMatches vets a caller-supplied compressor against the image it

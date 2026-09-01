@@ -348,23 +348,17 @@ func (s *xzBlockSplitter) next() (payload []byte, uSize int, err error) {
 type xzCLI struct {
 	// path is the xz binary; empty means look it up on demand.
 	path string
-	// threads is passed as -T. It must be at least 2: thread counts change
+	// jobs is how many blocks xz may compress at once, passed as -T. Zero or
+	// less means every core; it is floored at 2 because thread counts change
 	// only speed, never output, but -T1 emits block headers without the
 	// compressed size, which xzBlockSplitter cannot walk forward.
-	threads int
+	jobs int
 }
 
 // xzMaxBlocksPerCall caps the --block-list argument. The kernel allows 128 KiB
 // per argv entry and 8192 blocks of up to seven digits stay well inside that,
 // while keeping the plaintext a caller must hold at once bounded.
 const xzMaxBlocksPerCall = 8192
-
-// xzMaxThreads caps -T. Thread count changes only how fast the output arrives,
-// never the output itself, but each thread holds its own encoder state and its
-// own slice of the input, so an unbounded count buys speed with memory -- and
-// buys none at all once it exceeds the number of blocks in the call. The cap is
-// what keeps a caller's -threads from setting apply memory.
-const xzMaxThreads = 8
 
 func (x *xzCLI) ID() uint16 { return compressorXz }
 
@@ -377,11 +371,23 @@ func (x *xzCLI) NeedsBlockSizes() bool { return false }
 
 func (x *xzCLI) SectionCodec() uint16 { return codecXZ }
 
-func (x *xzCLI) threadArg() int {
-	// -T1 is not merely slower: it omits the compressed size from each block
-	// header, which xzBlockSplitter needs in order to walk the stream forward
-	// instead of buffering it to reach the index.
-	return min(max(x.threads, 2), xzMaxThreads)
+// threadArg is the -T for a call compressing nBlocks blocks.
+//
+// Thread count changes only how fast the output arrives, never the output
+// itself -- --block-list has already fixed where every block begins, so each
+// one compresses from a fresh dictionary whichever thread takes it. What it
+// does change is memory: each thread holds its own encoder state and its own
+// slice of the input, measured here at 6.5 MiB for -T2 rising to 38 MiB for
+// -T16 on the same input. That is the trade --jobs makes.
+//
+// It is bounded twice. Below, by 2: -T1 is not merely slower, it omits the
+// compressed size from each block header, which xzBlockSplitter needs in order
+// to walk the stream forward instead of buffering it to reach the index. Above,
+// by the number of blocks in the call, because a thread with no block to take
+// costs its encoder state and buys nothing -- and a patch run is often a
+// handful of blocks, where the difference is the whole allocation.
+func (x *xzCLI) threadArg(nBlocks int) int {
+	return max(min(resolveJobs(x.jobs), nBlocks), 2)
 }
 
 func (x *xzCLI) binary() (string, error) {
@@ -434,7 +440,7 @@ func (x *xzCLI) CompressBlocks(ctx context.Context, plain BlockPlain, uSizes []i
 	// compresses it in isolation.
 	args := []string{
 		"-c", "-q", "--format=xz", "--check=crc32",
-		fmt.Sprintf("-T%d", x.threadArg()),
+		fmt.Sprintf("-T%d", x.threadArg(len(uSizes))),
 		fmt.Sprintf("--lzma2=preset=6,dict=%d", dictSize),
 		"--block-list=" + list.String(),
 		"-",
@@ -625,6 +631,14 @@ func xzDecompressTo(ctx context.Context, w io.Writer, r io.Reader, wantLen int) 
 	if err != nil {
 		return 0, err
 	}
+	// -T1 rather than the caller's job count, which sounds like a missed
+	// opportunity and is not one. A squashfs xz block is a single-block stream
+	// and a run is those streams concatenated, and xz's threaded decoder
+	// parallelises blocks within a stream, not streams within its input: on a
+	// 200 MiB run of 1600 such blocks, -T1 and -T8 both take 1.97s and the only
+	// measurable difference is 300 KiB more resident. Decompressing a run in
+	// parallel would mean splitting it here and running one xz per piece, which
+	// is what NeedsBlockSizes would have to become true to allow.
 	cmd := exec.CommandContext(ctx, bin, "-dc", "-q", "-T1", "-")
 	cmd.Stdin = r
 	var stderr bytes.Buffer

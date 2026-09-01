@@ -122,9 +122,9 @@ func printApplyStats(s *applyStats, elapsed time.Duration) {
 // parameter list because most of it exists for the sweeps, and a call site of
 // five bare booleans says nothing about which is which.
 type genCmdOpts struct {
-	Threads int
-	MaxRun  int
-	Verify  bool
+	Jobs   int
+	MaxRun int
+	Verify bool
 	// NoPatchRuns and NoPathMatch each turn off one half of the size
 	// optimisation, so a measurement can attribute what it buys.
 	NoPatchRuns bool
@@ -169,7 +169,7 @@ func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string
 		runLog = os.Stderr
 	}
 	stats, err := generateBlockPlan(ctx, sourceSnap, targetSnap, delta, blockPlanGenOpts{
-		Threads:     o.Threads,
+		Jobs:        o.Jobs,
 		MaxRunUSize: o.MaxRun,
 
 		Verify:      o.Verify,

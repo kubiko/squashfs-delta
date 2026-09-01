@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"testing"
 )
@@ -334,5 +335,117 @@ func TestCompressorRefusesMismatchedOverride(t *testing.T) {
 					compressorName(id), compressorName(other))
 			}
 		}
+	}
+}
+
+// TestCompressorIgnoresJobCount is the property the --jobs flag rests on: how
+// many blocks are worked on at once changes how long the work takes and how
+// much memory it holds, and nothing else. Every squashfs block is compressed
+// independently of its neighbours, so a block's bytes cannot depend on which
+// worker took it -- and if they ever did, a delta generated on a build machine
+// would not apply on a device with a different core count.
+func TestCompressorIgnoresJobCount(t *testing.T) {
+	ctx := context.Background()
+	// Enough blocks to fill several batches at every job count below, so the
+	// batching itself is exercised rather than one short batch.
+	const nBlocks = 21
+	blocks := make([][]byte, nBlocks)
+	uSizes := make([]int, nBlocks)
+	var plain []byte
+	for i := range blocks {
+		switch i % 3 {
+		case 0:
+			blocks[i] = compressibleText(testBlockSize, fmt.Sprintf("jobs-%d", i))
+		case 1:
+			blocks[i] = compressibleText(9000+i, fmt.Sprintf("short-%d", i))
+		default:
+			blocks[i] = incompressible(4096, int64(i))
+		}
+		uSizes[i] = len(blocks[i])
+		plain = append(plain, blocks[i]...)
+	}
+
+	for _, id := range implementedCompressorIDs() {
+		t.Run(compressorName(id), func(t *testing.T) {
+			// compress returns the concatenated on-disk bytes, each block's
+			// length, and which blocks came back raw.
+			compress := func(jobs int) (stored []byte, cSizes []int, raw []bool) {
+				t.Helper()
+				comp, err := newCompressor(id, jobs)
+				if err != nil {
+					t.Skipf("cannot use the %s compressor here: %v", compressorName(id), err)
+				}
+				err = comp.CompressBlocks(ctx, plainBytes(plain), uSizes, testBlockSize,
+					func(idx int, blk CompressedBlock) error {
+						if idx != len(cSizes) {
+							return fmt.Errorf("block %d arrived at position %d, out of order", idx, len(cSizes))
+						}
+						stored = append(stored, blk.OnDisk...)
+						cSizes = append(cSizes, blk.OnDiskLen())
+						raw = append(raw, blk.Raw)
+						return nil
+					})
+				if err != nil {
+					t.Fatalf("compressing with %d jobs: %v", jobs, err)
+				}
+				return stored, cSizes, raw
+			}
+
+			wantStored, wantCSizes, wantRaw := compress(1)
+			for _, jobs := range []int{2, 4, 16} {
+				gotStored, gotCSizes, gotRaw := compress(jobs)
+				if !bytes.Equal(gotStored, wantStored) {
+					t.Fatalf("%d jobs produced %d bytes on disk, one job produced %d, and they differ",
+						jobs, len(gotStored), len(wantStored))
+				}
+				if !slices.Equal(gotCSizes, wantCSizes) {
+					t.Errorf("%d jobs: block lengths %v, want %v", jobs, gotCSizes, wantCSizes)
+				}
+				if !slices.Equal(gotRaw, wantRaw) {
+					t.Errorf("%d jobs: raw-stored blocks %v, want %v", jobs, gotRaw, wantRaw)
+				}
+			}
+
+			// The reading half, over the compressed blocks only: a raw block's
+			// bytes are its plaintext and callers splice them in themselves.
+			var cStored []byte
+			var cSizes []int
+			var cPlain []byte
+			off := 0
+			for i, c := range wantCSizes {
+				if !wantRaw[i] {
+					cStored = append(cStored, wantStored[off:off+c]...)
+					cSizes = append(cSizes, c)
+					cPlain = append(cPlain, blocks[i]...)
+				}
+				off += c
+			}
+			for _, jobs := range []int{1, 2, 4, 16} {
+				comp, err := newCompressor(id, jobs)
+				if err != nil {
+					t.Skipf("cannot use the %s compressor here: %v", compressorName(id), err)
+				}
+				got, gotU, err := comp.DecompressBlocks(ctx, nil, cStored, cSizes, testBlockSize)
+				if err != nil {
+					t.Fatalf("decompressing with %d jobs: %v", jobs, err)
+				}
+				if !bytes.Equal(got, cPlain) {
+					t.Errorf("%d jobs: DecompressBlocks returned %d bytes, want %d matching",
+						jobs, len(got), len(cPlain))
+				}
+				if len(gotU) != len(cSizes) {
+					t.Errorf("%d jobs: %d block lengths, want %d", jobs, len(gotU), len(cSizes))
+				}
+
+				var buf bytes.Buffer
+				n, err := comp.DecompressTo(ctx, &buf, bytes.NewReader(cStored), cSizes, testBlockSize, len(cPlain))
+				if err != nil {
+					t.Fatalf("streaming with %d jobs: %v", jobs, err)
+				}
+				if n != int64(len(cPlain)) || !bytes.Equal(buf.Bytes(), cPlain) {
+					t.Errorf("%d jobs: DecompressTo wrote %d bytes, want %d matching", jobs, n, len(cPlain))
+				}
+			}
+		})
 	}
 }

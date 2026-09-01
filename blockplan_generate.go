@@ -102,9 +102,9 @@ type blockPlanGenOpts struct {
 	// superblock, because a compressor that does not match the image produces
 	// blocks that are valid and wrong.
 	Comp Compressor
-	// Threads is a hint for the derived compressor, ignored by the in-process
-	// ones. Zero lets it decide.
-	Threads int
+	// Jobs is how many blocks the derived compressor may work on at once.
+	// Zero or less means every core.
+	Jobs int
 	// HdiffzPath and HpatchzPath are the patch tool binaries; empty means
 	// look them up.
 	HdiffzPath  string
@@ -148,6 +148,11 @@ type blockPlanGenOpts struct {
 // cuts the delta from 16.56 MiB to 5.13 MiB on the pair with the most churn.
 // A caller that must hold a tighter ceiling lowers this and the applier's
 // negotiation enforces it -- at the cost of a larger delta.
+//
+// The other term in that demand is the job count, which this constant does not
+// bound: each job the applier runs holds its own compressor state and its own
+// block buffers, measured at 17.1 MiB resident for one job against 38.2 MiB for
+// eight on an lzo image. A device with a ceiling sets both.
 const defaultMaxRunUSize = 8 << 20
 
 // generateBlockPlan writes a snap-2-1-blocks delta from sourcePath to
@@ -184,7 +189,7 @@ func generateBlockPlan(ctx context.Context, sourcePath, targetPath, deltaPath st
 	// The compressor comes from the image, so nothing has to be told what built
 	// it. An override is honoured only if it agrees with the superblock.
 	if opts.Comp == nil {
-		if opts.Comp, err = newCompressor(tgt.SB.CompressionId, opts.Threads); err != nil {
+		if opts.Comp, err = newCompressor(tgt.SB.CompressionId, opts.Jobs); err != nil {
 			return nil, err
 		}
 	} else if err := checkCompressorMatches(opts.Comp, tgt.SB.CompressionId); err != nil {

@@ -395,8 +395,11 @@ func generateSnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSna
 	return nil
 }
 
-// ApplyDelta uses sourceSnap and delta files to generate targetSnap.
-func ApplyDelta(sourceSnap, delta, targetSnap string) error {
+// ApplyDelta uses sourceSnap and delta files to generate targetSnap. jobs is
+// how many blocks the compressor may work on at once, and reaches only the
+// block-plan format: the pseudo-file formats hand a whole stream to one
+// mksquashfs, which decides its own parallelism.
+func ApplyDelta(sourceSnap, delta, targetSnap string, jobs int) error {
 	// Global Context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -437,7 +440,7 @@ func ApplyDelta(sourceSnap, delta, targetSnap string) error {
 		if _, err := deltaFile.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
-		return applyBlockPlanToFile(ctx, sourceSnap, deltaFile, targetSnap, blockPlanApplyOpts{})
+		return applyBlockPlanToFile(ctx, sourceSnap, deltaFile, targetSnap, blockPlanApplyOpts{Jobs: jobs})
 	default:
 		return fmt.Errorf("unknown delta file format")
 	}
@@ -1903,16 +1906,16 @@ type cli struct {
 
 	genSource, genTarget, genDelta                  string
 	xdelta3Tool, hdiffzTool, blocksFormat           bool
-	genThreads, genMaxRun, genMinSaving             int
+	genJobs, genMaxRun, genMinSaving                int
 	genNoVerify, genNoPatchRuns, genNoPathMatch     bool
 	genRunLog                                       bool
 	genWindowRatio, genMinSavingRate, genWindowBack float64
 
 	appSource, appTarget, appDelta string
 	appReport                      bool
-	appMaxRun                      int
+	appMaxRun, appJobs             int
 
-	stSample, stThreads int
+	stSample, stJobs int
 }
 
 // subcommand is one operation as the help prints it: what it is called, what it
@@ -1955,7 +1958,8 @@ func newCLI() *cli {
 	c.generate.BoolVar(&c.blocksFormat, "blocks", false, "generate a "+snapDeltaFormatBlocks+" delta, which the applier can assemble without recompressing unchanged blocks")
 	c.generate.BoolVar(&c.hdiffzTool, "hdiffz", false, "generate a "+snapDeltaFormatHdiffz+" delta: hdiffz over a squashfs pseudo-file definition, one file at a time because the tool does not stream")
 	c.generate.BoolVar(&c.xdelta3Tool, "xdelta3", false, "generate a "+snapDeltaFormatXdelta3+" delta: xdelta3 over a squashfs pseudo-file definition")
-	c.generate.IntVar(&c.genThreads, "threads", 0, "xz thread count, at least 2 (0 = default)")
+	c.generate.IntVar(&c.genJobs, "jobs", 0, "blocks the compressor may work on at once, which is what uses the machine's cores (0 = one per core). Each job holds its own encoder state and buffers, so raising it raises peak memory too")
+	c.generate.IntVar(&c.genJobs, "j", 0, "shorthand for -jobs")
 	c.generate.IntVar(&c.genMaxRun, "max-run", 0, "cap on the plaintext one patch run reconstructs, which bounds apply memory (0 = default)")
 	c.generate.BoolVar(&c.genNoVerify, "no-verify", false, "skip running the applier over the finished delta (--blocks only)")
 	// The six that follow drive the cost model from the command line, which is
@@ -1978,12 +1982,15 @@ func newCLI() *cli {
 	c.apply.StringVar(&c.appDelta, "d", "", "shorthand for -delta")
 	c.apply.BoolVar(&c.appReport, "stats", false, "report what the apply cost: instructions, bytes copied and compressed, peak memory")
 	c.apply.IntVar(&c.appMaxRun, "max-run", 0, "refuse a delta whose patch runs need more than this many bytes at once (0 = accept any)")
+	c.apply.IntVar(&c.appJobs, "jobs", 0, "blocks the compressor may work on at once, which is what uses the machine's cores (0 = one per core). Each job holds its own encoder state and buffers, so raising it raises peak memory too")
+	c.apply.IntVar(&c.appJobs, "j", 0, "shorthand for -jobs")
 
 	// Development subcommands for the block-plan format: 'inspect' dumps an
 	// image's layout, 'selftest' is the gate that the local compressor
 	// reproduces the image's own blocks byte for byte.
 	c.selftest.IntVar(&c.stSample, "sample", 0, "check only this many data blocks, spread across the image (0 = all)")
-	c.selftest.IntVar(&c.stThreads, "threads", 0, "xz thread count, at least 2 (0 = default)")
+	c.selftest.IntVar(&c.stJobs, "jobs", 0, "blocks the compressor may work on at once, which is what uses the machine's cores (0 = one per core). Each job holds its own encoder state and buffers, so raising it raises peak memory too")
+	c.selftest.IntVar(&c.stJobs, "j", 0, "shorthand for -jobs")
 
 	for _, s := range c.subcommands() {
 		s := s
@@ -2078,7 +2085,7 @@ func main() {
 		}
 		if c.blocksFormat {
 			err = cmdGenerateBlocks(context.Background(), c.genSource, c.genTarget, c.genDelta, genCmdOpts{
-				Threads:       c.genThreads,
+				Jobs:          c.genJobs,
 				MaxRun:        c.genMaxRun,
 				Verify:        !c.genNoVerify,
 				NoPatchRuns:   c.genNoPatchRuns,
@@ -2118,11 +2125,11 @@ func main() {
 			if df, err = os.Open(c.appDelta); err == nil {
 				defer df.Close()
 				_, err = applyBlockPlanReport(context.Background(), c.appSource, df, c.appTarget,
-					blockPlanApplyOpts{MaxRunUSize: c.appMaxRun}, true)
+					blockPlanApplyOpts{MaxRunUSize: c.appMaxRun, Jobs: c.appJobs}, true)
 			}
 			break
 		}
-		err = ApplyDelta(c.appSource, c.appDelta, c.appTarget)
+		err = ApplyDelta(c.appSource, c.appDelta, c.appTarget, c.appJobs)
 
 	case "selftest":
 		c.selftest.Parse(os.Args[2:])
@@ -2130,7 +2137,7 @@ func main() {
 			c.selftest.Usage()
 			log.Fatal("Missing image arguments for 'selftest'")
 		}
-		err = cmdSelftest(context.Background(), c.selftest.Args(), c.stSample, c.stThreads)
+		err = cmdSelftest(context.Background(), c.selftest.Args(), c.stSample, c.stJobs)
 
 	case "inspect":
 		c.inspect.Parse(os.Args[2:])
