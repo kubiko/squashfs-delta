@@ -1,0 +1,675 @@
+// -*- Mode: Go; indent-tabs-mode: t -*-
+
+/*
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3 as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/binary"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+// This file reproduces, byte for byte, the .xz streams that mksquashfs stores
+// in a squashfs image, without linking liblzma.
+//
+// Every squashfs data and metadata block is compressed independently by
+// xz_wrapper.c as a complete .xz stream:
+//
+//	lzma_stream_buffer_encode(chain, LZMA_CHECK_CRC32, NULL,
+//	                          src, size, out, &len, block_size)
+//
+// with a plain LZMA2 chain at preset 6 whose dict_size is the block size
+// (131072 for data blocks, SQUASHFS_METADATA_SIZE=8192 for metadata).
+//
+// The container that call emits is fully synthesizable, so only the LZMA2
+// payload has to come from the real encoder -- and that can be obtained for a
+// whole run of blocks with a single `xz --block-list=...` invocation, which
+// amortizes away the process cost that makes per-block invocation twice as
+// expensive as in-process liblzma.
+//
+// The one non-obvious rule lives in liblzma's block_buffer_encoder.c: the block
+// header is laid out for the *worst case* compressed size lzma2_bound(uSize),
+// and then the actual, shorter, compressed-size varint is written into that
+// oversized header and zero-padded. That is why buffer-encoder output (16-byte
+// header, flags 0xC0 with both size fields present) differs from what the
+// streaming encoder -- including Go's and Python's stdlib wrappers -- produces
+// (12-byte header, flags 0x00). Reproducing squashfs blocks requires the
+// buffer-encoder form.
+
+const (
+	// xzCheckCRC32 is the stream flags check id for CRC32, which is what
+	// xz_wrapper.c asks for.
+	xzCheckCRC32 = 0x01
+	// lzma2FilterID is the .xz filter id of LZMA2.
+	lzma2FilterID = 0x21
+
+	// lzma2ChunkMax and lzma2HeaderUncompressed mirror liblzma's
+	// lzma2_encoder.c: an incompressible chunk carries at most 2 MiB of
+	// payload behind a 3-byte header.
+	lzma2ChunkMax           = 1 << 21
+	lzma2HeaderUncompressed = 3
+
+	// blockHeaderFlagCompressedSize and blockHeaderFlagUncompressedSize are
+	// the .xz block header flag bits announcing the two optional size
+	// fields. The buffer encoder always sets both.
+	blockHeaderFlagCompressedSize   = 0x40
+	blockHeaderFlagUncompressedSize = 0x80
+
+	// vliMax is the largest representable .xz variable-length integer.
+	vliMax = uint64(1)<<63 - 1
+)
+
+var (
+	xzStreamMagic = []byte{0xfd, '7', 'z', 'X', 'Z', 0x00}
+	xzFooterMagic = []byte{'Y', 'Z'}
+)
+
+// toolPath resolves an external tool to an executable path, following the same
+// order as cmdFromSystemSnapImpl -- the bundled snap copy first, then $PATH --
+// but returning the path so callers can build their own exec.Cmd. Results are
+// cached because the block plan resolves xz once per run of blocks.
+var (
+	toolPathCache   = map[string]string{}
+	toolPathCacheMu sync.Mutex
+)
+
+func toolPath(tool string) (string, error) {
+	toolPathCacheMu.Lock()
+	defer toolPathCacheMu.Unlock()
+	if p, ok := toolPathCache[tool]; ok {
+		if p == "" {
+			return "", fmt.Errorf("tool %q not found", tool)
+		}
+		return p, nil
+	}
+	loc := getAlternativeToolPath(tool)
+	if _, err := os.Stat(loc); err != nil {
+		p, err := exec.LookPath(tool)
+		if err != nil {
+			toolPathCache[tool] = ""
+			return "", fmt.Errorf("tool %q not found", tool)
+		}
+		loc = p
+	}
+	toolPathCache[tool] = loc
+	return loc, nil
+}
+
+// appendVLI appends n in the .xz variable-length integer encoding, seven bits
+// per byte, little end first, high bit marking continuation.
+func appendVLI(b []byte, n uint64) []byte {
+	for n >= 0x80 {
+		b = append(b, byte(n)|0x80)
+		n >>= 7
+	}
+	return append(b, byte(n))
+}
+
+// vliLen returns the number of bytes appendVLI would write for n.
+func vliLen(n uint64) int {
+	l := 1
+	for n >= 0x80 {
+		n >>= 7
+		l++
+	}
+	return l
+}
+
+// readVLI decodes a variable-length integer at buf[pos:], returning the value
+// and the position just past it.
+func readVLI(buf []byte, pos int) (uint64, int, error) {
+	var n uint64
+	for shift := uint(0); ; shift += 7 {
+		if pos >= len(buf) {
+			return 0, 0, io.ErrUnexpectedEOF
+		}
+		if shift > 63 {
+			return 0, 0, fmt.Errorf("varint longer than 9 bytes")
+		}
+		b := buf[pos]
+		pos++
+		n |= uint64(b&0x7f) << shift
+		if b&0x80 == 0 {
+			if b == 0 && shift != 0 {
+				return 0, 0, fmt.Errorf("varint has a redundant trailing zero byte")
+			}
+			return n, pos, nil
+		}
+	}
+}
+
+// lzma2Bound is liblzma's lzma2_bound(): the largest LZMA2 stream that u bytes
+// of input can produce, which is u stored verbatim in 2 MiB chunks plus the
+// end-of-payload marker.
+func lzma2Bound(u int) int {
+	chunks := (u + lzma2ChunkMax - 1) / lzma2ChunkMax
+	return u + chunks*lzma2HeaderUncompressed + 1
+}
+
+// dictProp returns the LZMA2 properties byte encoding dictSize, which liblzma
+// derives as dict = (2 | (p & 1)) << (p/2 + 11). Sizes that are not exactly
+// representable are rejected rather than rounded, because rounding would
+// silently produce blocks that do not match the image.
+func dictProp(dictSize int) (byte, error) {
+	for p := uint(0); p < 41; p++ {
+		if uint64(2|(p&1))<<(p/2+11) == uint64(dictSize) {
+			return byte(p), nil
+		}
+	}
+	return 0, fmt.Errorf("dictionary size %d is not exactly representable as an LZMA2 properties byte", dictSize)
+}
+
+// blockHeaderSize returns the .xz block header size that
+// lzma_block_buffer_encode reserves for a block of uSize bytes: sized for the
+// worst-case compressed size, not the real one.
+func blockHeaderSize(uSize int) int {
+	n := 2 // header size byte + flags
+	n += vliLen(uint64(lzma2Bound(uSize)))
+	n += vliLen(uint64(uSize))
+	n += vliLen(lzma2FilterID) + vliLen(1) + 1 // filter id, props length, props
+	n += 4                                     // header CRC32
+	return (n + 3) & ^3
+}
+
+// appendXZFrame appends to dst the complete .xz stream that
+// lzma_stream_buffer_encode would emit for a block whose LZMA2 payload is
+// payload, whose uncompressed form is uSize bytes long with CRC32 uCRC, and
+// which was compressed with the given dictionary size.
+func appendXZFrame(dst, payload []byte, uSize int, uCRC uint32, dictSize int) ([]byte, error) {
+	prop, err := dictProp(dictSize)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(payload)) > vliMax || uint64(uSize) > vliMax {
+		return nil, fmt.Errorf("block too large to frame: %d compressed, %d uncompressed", len(payload), uSize)
+	}
+	hSize := blockHeaderSize(uSize)
+
+	hdr := make([]byte, 0, hSize)
+	hdr = append(hdr, byte(hSize/4-1))
+	hdr = append(hdr, blockHeaderFlagCompressedSize|blockHeaderFlagUncompressedSize)
+	hdr = appendVLI(hdr, uint64(len(payload))) // the real size, in a header sized for the bound
+	hdr = appendVLI(hdr, uint64(uSize))
+	hdr = appendVLI(hdr, lzma2FilterID)
+	hdr = appendVLI(hdr, 1)
+	hdr = append(hdr, prop)
+	if len(hdr) > hSize-4 {
+		return nil, fmt.Errorf("internal error: block header overflowed its reserved %d bytes", hSize)
+	}
+	for len(hdr) < hSize-4 {
+		hdr = append(hdr, 0)
+	}
+	hdr = binary.LittleEndian.AppendUint32(hdr, crc32.ChecksumIEEE(hdr))
+
+	flags := [2]byte{0x00, xzCheckCRC32}
+
+	dst = append(dst, xzStreamMagic...)
+	dst = append(dst, flags[:]...)
+	dst = binary.LittleEndian.AppendUint32(dst, crc32.ChecksumIEEE(flags[:]))
+
+	dst = append(dst, hdr...)
+	dst = append(dst, payload...)
+	for pad := (-len(payload)) & 3; pad > 0; pad-- {
+		dst = append(dst, 0)
+	}
+	dst = binary.LittleEndian.AppendUint32(dst, uCRC)
+
+	// index: one record of (unpadded size, uncompressed size)
+	idx := make([]byte, 0, 32)
+	idx = append(idx, 0x00) // index indicator
+	idx = appendVLI(idx, 1) // record count
+	idx = appendVLI(idx, uint64(hSize+len(payload)+4))
+	idx = appendVLI(idx, uint64(uSize))
+	for pad := (-len(idx)) & 3; pad > 0; pad-- {
+		idx = append(idx, 0)
+	}
+	idx = binary.LittleEndian.AppendUint32(idx, crc32.ChecksumIEEE(idx))
+	dst = append(dst, idx...)
+
+	tail := make([]byte, 0, 6)
+	tail = binary.LittleEndian.AppendUint32(tail, uint32(len(idx)/4-1)) // backward size
+	tail = append(tail, flags[:]...)
+	dst = binary.LittleEndian.AppendUint32(dst, crc32.ChecksumIEEE(tail))
+	dst = append(dst, tail...)
+	dst = append(dst, xzFooterMagic...)
+	return dst, nil
+}
+
+// xzFramedLen returns the length appendXZFrame would produce, without building
+// it. Used to take the store-raw decision before committing a buffer.
+func xzFramedLen(payloadLen, uSize int) int {
+	hSize := blockHeaderSize(uSize)
+	idx := 1 + vliLen(1) + vliLen(uint64(hSize+payloadLen+4)) + vliLen(uint64(uSize))
+	idx = (idx + 3) & ^3
+	return 12 + hSize + payloadLen + ((-payloadLen) & 3) + 4 + idx + 4 + 12
+}
+
+// xzBlockSplitter walks an .xz stream forward, yielding each block's LZMA2
+// payload as it arrives. It never seeks back to the index, so it can consume
+// the output of a running xz process, but that requires the block headers to
+// carry the compressed size -- which `xz -T1` omits. Refuse rather than buffer.
+type xzBlockSplitter struct {
+	r    *bufio.Reader
+	hdr  []byte
+	done bool
+}
+
+func newXZBlockSplitter(r io.Reader) (*xzBlockSplitter, error) {
+	br := bufio.NewReaderSize(r, 1<<16)
+	head := make([]byte, 12)
+	if _, err := io.ReadFull(br, head); err != nil {
+		return nil, fmt.Errorf("cannot read xz stream header: %w", err)
+	}
+	if !bytes.Equal(head[:6], xzStreamMagic) {
+		return nil, fmt.Errorf("not an xz stream (magic %x)", head[:6])
+	}
+	if head[7] != xzCheckCRC32 {
+		return nil, fmt.Errorf("xz stream uses check %#x, want CRC32", head[7])
+	}
+	return &xzBlockSplitter{r: br, hdr: make([]byte, 1024)}, nil
+}
+
+// next returns the next block's payload and its declared uncompressed size, or
+// io.EOF once the index is reached. The returned slice is only valid until the
+// following call.
+func (s *xzBlockSplitter) next() (payload []byte, uSize int, err error) {
+	if s.done {
+		return nil, 0, io.EOF
+	}
+	b0, err := s.r.ReadByte()
+	if err != nil {
+		return nil, 0, fmt.Errorf("cannot read xz block header size: %w", err)
+	}
+	if b0 == 0x00 { // index indicator: no more blocks
+		s.done = true
+		return nil, 0, io.EOF
+	}
+	hSize := (int(b0) + 1) * 4
+	hdr := s.hdr[:hSize]
+	hdr[0] = b0
+	if _, err := io.ReadFull(s.r, hdr[1:]); err != nil {
+		return nil, 0, fmt.Errorf("cannot read xz block header: %w", err)
+	}
+	flags := hdr[1]
+	if flags&blockHeaderFlagCompressedSize == 0 {
+		return nil, 0, fmt.Errorf("xz block header omits the compressed size (flags %#02x); "+
+			"run xz with -T2 or higher", flags)
+	}
+	cSize64, pos, err := readVLI(hdr, 2)
+	if err != nil {
+		return nil, 0, fmt.Errorf("cannot read compressed size: %w", err)
+	}
+	var uSize64 uint64
+	if flags&blockHeaderFlagUncompressedSize != 0 {
+		if uSize64, _, err = readVLI(hdr, pos); err != nil {
+			return nil, 0, fmt.Errorf("cannot read uncompressed size: %w", err)
+		}
+	}
+	cSize := int(cSize64)
+	if cSize < 0 || cSize > 1<<30 {
+		return nil, 0, fmt.Errorf("implausible compressed block size %d", cSize64)
+	}
+	buf := make([]byte, cSize+((-cSize)&3)+4) // payload + padding + check
+	if _, err := io.ReadFull(s.r, buf); err != nil {
+		return nil, 0, fmt.Errorf("cannot read xz block payload: %w", err)
+	}
+	return buf[:cSize], int(uSize64), nil
+}
+
+// CompressedBlock is one squashfs block after compression.
+//
+// Raw reports the mangle2() decision: mksquashfs stores a block uncompressed
+// whenever compression did not shrink it, and then its on-disk bytes are simply
+// the plaintext. OnDisk is what the block occupies in the image either way, so
+// callers need not reproduce that choice.
+type CompressedBlock struct {
+	// OnDisk is the block's exact bytes in the image, excluding any
+	// metadata-block size header: the framed .xz stream, or the plaintext
+	// itself when the block is stored raw.
+	//
+	// It is valid only until the callback returns. Both cases can point into a
+	// reused buffer, so anything that outlives the call must copy.
+	OnDisk []byte
+	Raw    bool
+	USize  int
+}
+
+// OnDiskLen is the number of bytes this block occupies in the image, excluding
+// any metadata-block size header.
+func (b CompressedBlock) OnDiskLen() int { return len(b.OnDisk) }
+
+// BlockPlain is a run's plaintext as CompressBlocks needs to see it: a stream to
+// feed the encoder, plus access to one block at a time for the two things that
+// need individual blocks -- each block's CRC32, which goes into its .xz footer,
+// and a raw-stored block's body, which is its plaintext verbatim.
+//
+// It is an interface so that a run's plaintext need not sit in the heap, which is
+// what bounds apply memory to a block rather than to a whole run. There are
+// exactly two sources: a slice on the build machine, which decompressed the run
+// in order to diff it and so has the bytes anyway, and a file on the device,
+// where hpatchz has just written the run and nothing else wants it.
+type BlockPlain interface {
+	// Len is the total plaintext length. It must equal the sum of the block
+	// sizes passed alongside it.
+	Len() int
+	// Block returns the n bytes at off. The result is valid only until the
+	// next call, because a file-backed implementation reads into a reused
+	// buffer.
+	Block(off, n int) ([]byte, error)
+	// Stream returns the whole plaintext from the beginning, to be handed to
+	// the encoder as its standard input. It may be called only once.
+	Stream() (io.Reader, error)
+}
+
+// plainBytes is a run's plaintext in the heap, which is what the generator has.
+type plainBytes []byte
+
+func (p plainBytes) Len() int { return len(p) }
+
+func (p plainBytes) Block(off, n int) ([]byte, error) {
+	if off < 0 || n < 0 || off+n > len(p) {
+		return nil, fmt.Errorf("block [%d,+%d) is outside %d bytes of plaintext", off, n, len(p))
+	}
+	return p[off : off+n], nil
+}
+
+func (p plainBytes) Stream() (io.Reader, error) { return bytes.NewReader(p), nil }
+
+// plainFile is a run's plaintext in a file, which is what the applier has:
+// hpatchz wrote it there, and leaving it there is what keeps a run's worth of
+// plaintext out of the heap.
+type plainFile struct {
+	f   *os.File
+	n   int
+	buf []byte
+}
+
+func newPlainFile(f *os.File, n int) *plainFile { return &plainFile{f: f, n: n} }
+
+func (p *plainFile) Len() int { return p.n }
+
+func (p *plainFile) Block(off, n int) ([]byte, error) {
+	if off < 0 || n < 0 || off+n > p.n {
+		return nil, fmt.Errorf("block [%d,+%d) is outside %d bytes of plaintext", off, n, p.n)
+	}
+	if cap(p.buf) < n {
+		p.buf = make([]byte, n)
+	}
+	b := p.buf[:n]
+	if _, err := p.f.ReadAt(b, int64(off)); err != nil {
+		return nil, fmt.Errorf("reading plaintext [%d,+%d): %w", off, n, err)
+	}
+	return b, nil
+}
+
+func (p *plainFile) Stream() (io.Reader, error) {
+	// The file itself rather than a reader over it: os/exec gives an *os.File to
+	// the child as its own fd 0, with no pipe and no copying goroutine, so the
+	// plaintext goes from tmpfs into the encoder without passing through this
+	// process at all. Block() uses ReadAt, which does not disturb the offset the
+	// child is reading from.
+	if _, err := p.f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return p.f, nil
+}
+
+// Compressor turns plaintext into squashfs on-disk block bytes.
+//
+// Only xz is implemented, because every snap in the store is xz. A future lzo
+// or zstd cannot reuse the framing trick above -- neither has a container to
+// synthesize, and libzstd's output is version sensitive -- so it would sit
+// behind this interface as a coprocess over squashfs-tools' own
+// `struct compressor` vtable.
+type Compressor interface {
+	// CompressBlocks compresses each block of plain, delimited by uSizes,
+	// independently with the given dictionary size, calling fn once per
+	// block in ascending order. Blocks are independent, so callers may
+	// split a large run across several calls at any block boundary.
+	CompressBlocks(ctx context.Context, plain BlockPlain, uSizes []int, dictSize int, fn func(idx int, blk CompressedBlock) error) error
+	// MaxBlocksPerCall bounds how many blocks one call may carry.
+	MaxBlocksPerCall() int
+}
+
+// xzCLI drives the xz command line tool, using it only as an LZMA2 payload
+// source and synthesizing the squashfs container in appendXZFrame.
+type xzCLI struct {
+	// path is the xz binary; empty means look it up on demand.
+	path string
+	// threads is passed as -T. It must be at least 2: thread counts change
+	// only speed, never output, but -T1 emits block headers without the
+	// compressed size, which xzBlockSplitter cannot walk forward.
+	threads int
+}
+
+// xzMaxBlocksPerCall caps the --block-list argument. The kernel allows 128 KiB
+// per argv entry and 8192 blocks of up to seven digits stay well inside that,
+// while keeping the plaintext a caller must hold at once bounded.
+const xzMaxBlocksPerCall = 8192
+
+// xzMaxThreads caps -T. Thread count changes only how fast the output arrives,
+// never the output itself, but each thread holds its own encoder state and its
+// own slice of the input, so an unbounded count buys speed with memory -- and
+// buys none at all once it exceeds the number of blocks in the call. The cap is
+// what keeps a caller's -threads from setting apply memory.
+const xzMaxThreads = 8
+
+func (x *xzCLI) MaxBlocksPerCall() int { return xzMaxBlocksPerCall }
+
+func (x *xzCLI) threadArg() int {
+	// -T1 is not merely slower: it omits the compressed size from each block
+	// header, which xzBlockSplitter needs in order to walk the stream forward
+	// instead of buffering it to reach the index.
+	return min(max(x.threads, 2), xzMaxThreads)
+}
+
+func (x *xzCLI) binary() (string, error) {
+	if x.path != "" {
+		return x.path, nil
+	}
+	p, err := toolPath("xz")
+	if err != nil {
+		return "", err
+	}
+	x.path = p
+	return p, nil
+}
+
+func (x *xzCLI) CompressBlocks(ctx context.Context, plain BlockPlain, uSizes []int, dictSize int, fn func(int, CompressedBlock) error) error {
+	if len(uSizes) == 0 {
+		return nil
+	}
+	if len(uSizes) > xzMaxBlocksPerCall {
+		return fmt.Errorf("%d blocks in one call exceeds the cap of %d", len(uSizes), xzMaxBlocksPerCall)
+	}
+	total := 0
+	for i, u := range uSizes {
+		if u <= 0 {
+			return fmt.Errorf("block %d has non-positive size %d", i, u)
+		}
+		total += u
+	}
+	if total != plain.Len() {
+		return fmt.Errorf("block sizes sum to %d but %d bytes of plaintext were given", total, plain.Len())
+	}
+	if _, err := dictProp(dictSize); err != nil {
+		return err
+	}
+	bin, err := x.binary()
+	if err != nil {
+		return err
+	}
+
+	var list strings.Builder
+	for i, u := range uSizes {
+		if i > 0 {
+			list.WriteByte(',')
+		}
+		list.WriteString(strconv.Itoa(u))
+	}
+
+	// --block-list forces a block boundary at each listed size, so every
+	// block is compressed from a fresh dictionary exactly as mksquashfs
+	// compresses it in isolation.
+	args := []string{
+		"-c", "-q", "--format=xz", "--check=crc32",
+		fmt.Sprintf("-T%d", x.threadArg()),
+		fmt.Sprintf("--lzma2=preset=6,dict=%d", dictSize),
+		"--block-list=" + list.String(),
+		"-",
+	}
+	stdin, err := plain.Stream()
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Stdin = stdin
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("cannot run %s: %w", bin, err)
+	}
+	// From here on every return must reap the child, and must drain or
+	// close stdout so a blocked xz does not outlive this call.
+	fail := func(err error) error {
+		stdout.Close()
+		cmd.Wait()
+		return err
+	}
+
+	split, err := newXZBlockSplitter(stdout)
+	if err != nil {
+		return fail(err)
+	}
+	off, idx := 0, 0
+	for ; idx < len(uSizes); idx++ {
+		payload, declared, err := split.next()
+		if err == io.EOF {
+			return fail(fmt.Errorf("xz emitted only %d of %d blocks", idx, len(uSizes)))
+		}
+		if err != nil {
+			return fail(err)
+		}
+		uSize := uSizes[idx]
+		if declared != 0 && declared != uSize {
+			return fail(fmt.Errorf("block %d: xz split at %d bytes, expected %d", idx, declared, uSize))
+		}
+		// The block's own plaintext, for its CRC32 and -- if it turns out to be
+		// stored raw -- for its on-disk bytes. One block at a time is the whole
+		// reason CompressBlocks takes a BlockPlain rather than a slice.
+		src, err := plain.Block(off, uSize)
+		if err != nil {
+			return fail(fmt.Errorf("block %d: %w", idx, err))
+		}
+		off += uSize
+
+		blk := CompressedBlock{USize: uSize}
+		if xzFramedLen(len(payload), uSize) >= uSize {
+			// mangle2(): compression did not shrink the block, so mksquashfs
+			// stores it verbatim, and the plaintext is the on-disk form.
+			blk.Raw = true
+			blk.OnDisk = src
+		} else {
+			framed, err := appendXZFrame(nil, payload, uSize, crc32.ChecksumIEEE(src), dictSize)
+			if err != nil {
+				return fail(fmt.Errorf("block %d: %w", idx, err))
+			}
+			if len(framed) >= uSize {
+				return fail(fmt.Errorf("internal error: block %d framed to %d bytes, xzFramedLen predicted %d",
+					idx, len(framed), xzFramedLen(len(payload), uSize)))
+			}
+			blk.OnDisk = framed
+		}
+		if err := fn(idx, blk); err != nil {
+			return fail(err)
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("%s failed: %w: %s", bin, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// xzDecompressTo decompresses a concatenation of complete .xz streams -- which is
+// exactly what a run of squashfs blocks is -- from r to w, returning how much
+// plaintext came out and refusing any total other than wantLen. A negative
+// wantLen accepts whatever arrives.
+//
+// xz decodes concatenated streams in a single pass, so a whole window costs one
+// process regardless of how many blocks it spans. Neither side is ever held
+// whole: the compressed bytes stream in from the source and the plaintext streams
+// out to w, which is what lets the applier put a 12 MiB window in a file without
+// it passing through the heap.
+func xzDecompressTo(ctx context.Context, w io.Writer, r io.Reader, wantLen int) (int64, error) {
+	bin, err := toolPath("xz")
+	if err != nil {
+		return 0, err
+	}
+	cmd := exec.CommandContext(ctx, bin, "-dc", "-q", "-T1", "-")
+	cmd.Stdin = r
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, err
+	}
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("cannot run %s: %w", bin, err)
+	}
+	n, copyErr := copyBuffer(w, stdout)
+	// Closing before Wait means a failed write ends xz with EPIPE rather than
+	// leaving it blocked on a pipe nobody is draining.
+	stdout.Close()
+	waitErr := cmd.Wait()
+	if copyErr != nil {
+		// A failed write to w is the real cause; xz's EPIPE is its consequence.
+		return n, copyErr
+	}
+	if waitErr != nil {
+		return n, fmt.Errorf("%s -dc failed: %w: %s", bin, waitErr, strings.TrimSpace(stderr.String()))
+	}
+	if wantLen >= 0 && n != int64(wantLen) {
+		return n, fmt.Errorf("decompressed %d bytes, expected %d", n, wantLen)
+	}
+	return n, nil
+}
+
+// xzDecompressAll is xzDecompressTo for callers that do want the plaintext in
+// memory: the generator, which is going to diff or hash it, and the metadata
+// region, which is under a megabyte.
+func xzDecompressAll(ctx context.Context, streams []byte, wantLen int) ([]byte, error) {
+	var out bytes.Buffer
+	if wantLen > 0 {
+		out.Grow(wantLen)
+	}
+	if _, err := xzDecompressTo(ctx, &out, bytes.NewReader(streams), wantLen); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
