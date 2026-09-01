@@ -107,6 +107,19 @@ type blockPlanGenOpts struct {
 	Tuning *patchRunTuning
 }
 
+// defaultMaxRunUSize sets what an apply demands in RAM, because a run's
+// plaintext and its source window are held in scratch at once. With the default
+// WindowRatio of 1.5 the scratch high-water mark is maxRun + 1.5*maxRun + the
+// patch, which the M8 matrix measured at 20.4-21.6 MiB across the snapcraft and
+// kernel pairs, on top of 4.3-13.2 MiB resident -- so roughly 33 MiB of total
+// demand in the worst case, all of it bounded by this constant rather than by
+// the largest file in the image.
+//
+// That is deliberately above the ~20 MiB first estimated for this work, which
+// assumed a window ratio of 1.0; the ratio was later raised to 1.5 because it
+// cuts the delta from 16.56 MiB to 5.13 MiB on the pair with the most churn.
+// A caller that must hold a tighter ceiling lowers this and the applier's
+// negotiation enforces it -- at the cost of a larger delta.
 const defaultMaxRunUSize = 8 << 20
 
 // generateBlockPlan writes a snap-2-1-blocks delta from sourcePath to

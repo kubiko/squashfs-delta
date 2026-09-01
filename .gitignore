@@ -1,1 +1,4 @@
 snap-delta
+snap-delta-blocks
+bench/*.log
+.claude/
