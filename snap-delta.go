@@ -23,7 +23,6 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"log"
 	"math"
@@ -40,12 +39,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// This file implements the support for snap deltas. Currently two formats are
-// supported:
+// This file implements the support for snap deltas. Currently three formats
+// are supported:
 //
 // - plain xdelta3 diff file on the compressed snaps
 // - xdelta3 diff on an uncompressed representation of the snap files defined
 //   by squashfs-tools called pseudo-files
+// - snap-2-1-blocks, which describes the target as instructions over the
+//   source's already-compressed blocks; see blockplan.go
 //
 // The format supporting pseudo-files has files with a header preceding the
 // xdelta3 information. This header is padded to 'deltaHeaderSize' size to
@@ -81,7 +82,6 @@ const (
 	// Identifiers for the formats in the API
 	Xdelta3Format DeltaFormat = iota
 	SnapXdelta3Format
-	SnapHdiffzFormat
 	SnapBlockPlanFormat
 
 	// Identifiers for the store
@@ -90,7 +90,6 @@ const (
 	// number represent format and tools versions respectively, and could
 	// use intervals in the future.
 	snapDeltaFormatXdelta3 = "snap-1-1-xdelta3"
-	snapDeltaFormatHdiffz  = "snap-1-1-Hdiffz"
 )
 
 const (
@@ -110,12 +109,11 @@ const (
 	deltaFormatVersion      = uint8(0x01)
 	deltaFormatToolsVersion = uint8(0x01)
 
-	// Tool IDs
+	// Tool IDs. DeltaToolHdiffz names no snap-1-1 format any more -- that one
+	// was removed -- but it stays as the id snap-2-1-blocks records for the
+	// tool its patch runs were diffed with.
 	DeltaToolXdelta3 = uint16(0x1)
 	DeltaToolHdiffz  = uint16(0x2)
-
-	// default delta tool
-	defaultDeltaTool = DeltaToolHdiffz
 )
 
 // SquashfsSuperblock represents a SquashFS header up to the minor_version field.
@@ -314,8 +312,6 @@ func formatStoreString(id DeltaFormat) string {
 		return xdelta3Format
 	case SnapXdelta3Format:
 		return snapDeltaFormatXdelta3
-	case SnapHdiffzFormat:
-		return snapDeltaFormatHdiffz
 	case SnapBlockPlanFormat:
 		return snapDeltaFormatBlocks
 	}
@@ -324,7 +320,7 @@ func formatStoreString(id DeltaFormat) string {
 
 // Supported delta formats
 func SupportedDeltaFormats() []string {
-	return []string{formatStoreString(SnapBlockPlanFormat), formatStoreString(SnapHdiffzFormat),
+	return []string{formatStoreString(SnapBlockPlanFormat),
 		formatStoreString(SnapXdelta3Format), formatStoreString(Xdelta3Format)}
 }
 
@@ -341,8 +337,6 @@ func GenerateDelta(sourceSnap, targetSnap, delta string, deltaFormat DeltaFormat
 		return generatePlainXdelta3Delta(ctx, sourceSnap, targetSnap, delta)
 	case SnapXdelta3Format:
 		return generateSnapDelta(ctx, cancel, sourceSnap, targetSnap, delta, DeltaToolXdelta3)
-	case SnapHdiffzFormat:
-		return generateSnapDelta(ctx, cancel, sourceSnap, targetSnap, delta, DeltaToolHdiffz)
 	case SnapBlockPlanFormat:
 		_, err := generateBlockPlan(ctx, sourceSnap, targetSnap, delta,
 			blockPlanGenOpts{Verify: true})
@@ -380,8 +374,6 @@ func generateSnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSna
 	switch deltaFormat {
 	case DeltaToolXdelta3:
 		err = generateXdelta3Delta(ctx, deltaFile, sourceSnap, targetSnap)
-	case DeltaToolHdiffz:
-		err = generateHdiffzDelta(ctx, cancel, deltaFile, sourceSnap, targetSnap)
 	default:
 		err = fmt.Errorf("unsupported delta tool 0x%X", hdr.DeltaTool)
 	}
@@ -455,7 +447,7 @@ func applySnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap, 
 		return fmt.Errorf("incompatible version %d.%d",
 			hdr.FormatVersion, hdr.ToolsVersion)
 	}
-	if hdr.DeltaTool != DeltaToolXdelta3 && hdr.DeltaTool != DeltaToolHdiffz {
+	if hdr.DeltaTool != DeltaToolXdelta3 {
 		return fmt.Errorf("unsupported delta tool %d", hdr.DeltaTool)
 	}
 
@@ -474,8 +466,6 @@ func applySnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap, 
 	switch hdr.DeltaTool {
 	case DeltaToolXdelta3:
 		return applyXdelta3Delta(ctx, sourceSnap, targetSnap, deltaFile, mksqfsArgs)
-	case DeltaToolHdiffz:
-		return applyHdiffzDelta(ctx, cancel, sourceSnap, targetSnap, deltaFile, mksqfsArgs)
 	default:
 		return fmt.Errorf("unsupported delta tool 0x%X", hdr.DeltaTool)
 	}
@@ -686,636 +676,7 @@ func applyXdelta3Delta(ctx context.Context, sourceSnap, targetSnap string, delta
 	return osutilRunManyWithContext(ctx, cmds, []func(context.Context) error{deltaWriter})
 }
 
-// --- Hdiffz Implementations ---
-func generateHdiffzDelta(ctx context.Context, cancel context.CancelFunc, deltaFile *os.File, sourceSnap, targetSnap string) error {
-	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
-
-	// Setup all pipes
-	tempDir, pipes, err := setupPipes("src-pipe", "trgt-pipe")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tempDir)
-	sourcePipe := pipes[0]
-	targetPipe := pipes[1]
-
-	// Output to sourcePipe, -pf stands for pseudo-file representation
-	unsquashSrcArg := append([]string{}, unsquashfsTuningGenerate...)
-	unsquashSrcArg = append(unsquashSrcArg, "-no-progress", "-pf", sourcePipe, sourceSnap)
-	unsquashSrcCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/unsquashfs", unsquashSrcArg...)
-	if err != nil {
-		return fmt.Errorf("cannot find unsquashfs: %w", err)
-	}
-	// Output to targetPipe.
-	// Leave progress output to show it when we run "snap delta".
-	unsquashTrgArg := append([]string{}, unsquashfsTuningGenerate...)
-	unsquashTrgArg = append(unsquashTrgArg, "-pf", targetPipe, targetSnap)
-	unsquashTrgCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/unsquashfs", unsquashTrgArg...)
-	if err != nil {
-		return fmt.Errorf("cannot find unsquashfs: %w", err)
-	}
-
-	// prepare hpatchz
-	hdiffzCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/hdiffz", "")
-	if err != nil {
-		return fmt.Errorf("cannot find hdiffz: %w", err)
-	}
-	hdiffzPath := hdiffzCmd.Path
-
-	wg.Add(2)
-	// unsquash source
-	go func() {
-		defer wg.Done()
-		if err := runWithContext(ctx, unsquashSrcCmd); err != nil {
-			select {
-			case errCh <- wrapErr(err, "unsqfs-src"):
-			default:
-			}
-			cancel()
-		}
-	}()
-
-	// unsquash target
-	go func() {
-		defer wg.Done()
-		if err := runWithContext(ctx, unsquashTrgCmd); err != nil {
-			select {
-			case errCh <- wrapErr(err, "unsqfs-trg"):
-			default:
-			}
-			cancel()
-		}
-	}()
-
-	defer func() {
-		cancel()
-		wg.Wait()
-	}()
-
-	sp, err := os.Open(sourcePipe)
-	if err != nil {
-		return fmt.Errorf("failed to open source pipe:%v", err)
-	}
-	defer sp.Close()
-	tp, err := os.Open(targetPipe)
-	if err != nil {
-		return fmt.Errorf("failed to open target pipe:%v", err)
-	}
-	defer tp.Close()
-	sourceReader := bufio.NewReaderSize(sp, CopyBufferSize)
-	targetReader := bufio.NewReaderSize(tp, CopyBufferSize)
-
-	// 2. Parse Headers
-	// Parse source into a Map for O(1) lookup
-	sourceEntries, sourceHeaderBuff, err := parsePseudoStream(sourceReader)
-	if err != nil {
-		return fmt.Errorf("failed to parse source header: %w", err)
-	}
-
-	sourceEntriesCount := len(sourceEntries)
-	// Map for fast lookups: FilePath -> Entry
-	sourceMap := make(map[string]*PseudoEntry, sourceEntriesCount)
-	for i := range sourceEntries {
-		sourceEntries[i].OriginalIndex = i
-		sourceMap[sourceEntries[i].FilePath] = &sourceEntries[i]
-	}
-
-	targetEntries, targetHeaderBuff, err := parsePseudoStream(targetReader)
-	if err != nil {
-		return fmt.Errorf("failed to parse target header: %w", err)
-	}
-
-	// Prepare reusable Processors for diffing
-	srcMem, err := NewReusableMemFD("src-seg")
-	if err != nil {
-		return fmt.Errorf("failed to prepare reusable memFd: %w", err)
-	}
-	defer srcMem.Close()
-	targetMem, err := NewReusableMemFD("trgt-seg")
-	if err != nil {
-		return fmt.Errorf("failed to prepare reusable memFd: %w", err)
-	}
-	defer targetMem.Close()
-
-	diffMem, err := NewReusableMemFD("seg-diff")
-	if err != nil {
-		return fmt.Errorf("failed to prepare reusable memFd: %w", err)
-	}
-	defer diffMem.Close()
-
-	// calculate header Delta and write it to the delta stream, use prepare mem processors
-	_, err = srcMem.File.Write(sourceHeaderBuff.Bytes())
-	if err != nil {
-		return fmt.Errorf("failed to write source header to memFd: %w", err)
-	}
-	_, err = targetMem.File.Write(targetHeaderBuff.Bytes())
-	if err != nil {
-		return fmt.Errorf("failed to write target header to memFd: %w", err)
-	}
-	segmentDeltaSize, err := writeHdiffzToDeltaStream(ctx, deltaFile, 0, int64(sourceHeaderBuff.Len()), srcMem, targetMem, diffMem, hdiffzPath)
-	if err != nil {
-		return fmt.Errorf("failed to calculate delta on headers: %w", err)
-	}
-
-	sourceHeaderSize := int64(sourceHeaderBuff.Len())
-	bufferPool.Put(sourceHeaderBuff)
-	bufferPool.Put(targetHeaderBuff)
-
-	sourceRead := int64(0)
-	totalDeltaSize := int64(24 + segmentDeltaSize)
-	lastSourceIndex := 0
-	targetEntrieCount := len(targetEntries)
-	fmt.Printf("Processing %d target entries against %d source entries\n", targetEntrieCount, sourceEntriesCount)
-	// Main Processing Loop
-LOOP:
-	for i, te := range targetEntries {
-		// Check context before processing entry
-		if ctx.Err() != nil {
-			break LOOP
-		}
-
-		// Reset MemFDs for reuse
-		srcMem.Reset()
-		targetMem.Reset()
-		diffMem.Reset()
-
-		// Try Exact Match
-		sourceEntry := sourceMap[te.FilePath]
-		// Fallback: Fuzzy Match for directory or filename change
-		if sourceEntry == nil {
-			// We must select a candidate that is physically AHEAD in the stream as cannot rewind the source pipe
-			// We do not want to advance too much either, it could be false "match"
-			// assuming we compare software, allow "version" change in fuzzy match
-			// find first fuzzy match, max MaxLookaheadIndex entries eahead
-			// build score from different criteria
-			//  - exact basefilename match: or exact directory match: FuzzyExactFileDirMarchScore
-			//  - size +-MaxFileSizeDeltaPerc% difference: up to MaxFileSizeScore points
-			//  - index delta from last index: MaxLookaheadIndex - index delta
-			// if score > FuzzyMinSimilarityThreshold it's match
-			lookout := min(lastSourceIndex+FuzzyMaxLookaheadIndex, sourceEntriesCount) // which ever is smaller
-			for i := lastSourceIndex + 1; i < lookout; i++ {
-				se := sourceEntries[i]
-				fuzzyMatch := pathsMatchFuzzy(se.FilePath, te.FilePath)
-				if fuzzyMatch != 0 {
-					// build the rest of the score
-					score := getSimilarityScore(se.DataSize, te.DataSize, FuzzyMaxFileSizeDeltaPerc) / FuzzyMaxFileSizeScore
-					// add look ahead score
-					score += FuzzyMaxLookaheadIndex + lastSourceIndex + 1 - i
-					// less then 3 matchis means either file name or dir path match exactly
-					if fuzzyMatch < 3 {
-						score += FuzzyExactFileDirMarchScore
-					}
-					if score > FuzzyMinSimilarityThreshold {
-						fmt.Printf("Fuzzy Match(%d): %s matched with old %s\n", score, te.FilePath, se.FilePath)
-						sourceEntry = &sourceEntries[i]
-						break
-					} else {
-						fmt.Printf("Ignoring Fuzzy Match(%d): %s with old %s\n", score, te.FilePath, se.FilePath)
-					}
-				}
-			}
-		}
-		sourceSize := int64(0)
-		sourceOffset := int64(0)
-
-		if sourceEntry != nil {
-			sourceSize = sourceEntry.DataSize
-			sourceOffset = sourceEntry.DataOffset
-			lastSourceIndex = sourceEntry.OriginalIndex
-		} else {
-			fmt.Printf("[%d/%d] No original version for: %s\n", i, targetEntrieCount, te.FilePath)
-		}
-
-		// Handle Source Stream extraction
-		// Calculate Source CRC while copying to detect identity without re-reading
-		srcCRC := crc32.NewIEEE()
-		// Only attempt to read source if we have a valid entry AND it's not behind us
-		// (The fuzzy logic ensures offset >= sourceRead, but exact match might not if the stream was mixed up)
-		if sourceSize > 0 && sourceOffset >= sourceRead {
-			toSkip := sourceOffset - sourceRead
-			if toSkip > 0 {
-				if _, err := copyNBuffer(io.Discard, sourceReader, toSkip); err != nil {
-					errCh <- fmt.Errorf("failed to skip source stream: %w", err)
-					cancel()
-					break LOOP
-				}
-				sourceRead += toSkip
-			}
-
-			// TeeReader reads from source, writes to srcMem AND srcCRC
-			mw := io.MultiWriter(srcMem.File, srcCRC)
-			if _, err := copyNBuffer(mw, sourceReader, sourceSize); err != nil {
-				errCh <- fmt.Errorf("failed to extract source segment: %w", err)
-				cancel()
-				break LOOP
-			}
-			sourceRead += sourceSize
-		} else if sourceEntry != nil && sourceOffset < sourceRead {
-			// Edge case: We found a match (exact or fuzzy), but it is physically located
-			// BEFORE our current pipe position. We cannot use it.
-			// Reset sourceSize so we treat this as a "New File" insertion.
-			sourceSize = 0
-			fmt.Printf("Skipping unsearchable source match (stream moved past): %s\n", sourceEntry.FilePath)
-		}
-
-		// Handle Target Stream extraction
-		targetCRC := crc32.NewIEEE()
-		mw := io.MultiWriter(targetMem.File, targetCRC)
-		if _, err := copyNBuffer(mw, targetReader, te.DataSize); err != nil {
-			errCh <- fmt.Errorf("failed to extract target segment: %w", err)
-			cancel()
-			break LOOP
-		}
-
-		// Determine Identity
-		isIdentical := false
-		if sourceEntry != nil && sourceSize == te.DataSize {
-			// Compare checksums instead of reading files again
-			if sourceSize == 0 || srcCRC.Sum32() == targetCRC.Sum32() {
-				isIdentical = true
-			}
-		}
-
-		if isIdentical {
-			// Files match, write negative index header
-			headerBuf := bufferPool.Get().(*bytes.Buffer)
-			headerBuf.Reset()
-			binary.Write(headerBuf, binary.LittleEndian, int64(-sourceEntry.OriginalIndex))
-			if _, err := deltaFile.Write(headerBuf.Bytes()); err != nil {
-				bufferPool.Put(headerBuf)
-				errCh <- err
-				cancel()
-				break LOOP
-			}
-			bufferPool.Put(headerBuf)
-			totalDeltaSize += 8
-		} else {
-			// Files differ, run hdiffz and store the delta
-			segSize, err := writeHdiffzToDeltaStream(ctx, deltaFile, sourceHeaderSize+sourceOffset, sourceSize, srcMem, targetMem, diffMem, hdiffzPath)
-			if err != nil {
-				errCh <- err
-				cancel()
-				break LOOP
-			}
-			totalDeltaSize += (segSize + 24)
-			fmt.Printf("[%d/%d] Delta: %s (%d bytes -> %d bytes)\n", i, targetEntrieCount, te.FilePath, te.DataSize, segSize)
-		}
-	}
-
-	// Wait for background tasks to finish
-	wg.Wait()
-	close(errCh)
-
-	// Check if any error occurred in main loop or background
-	if err := <-errCh; err != nil {
-		return err
-	}
-	// Check context
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-
-	// Validation that nothing was left in the target reader
-	if b := targetReader.Buffered(); b > 0 {
-		return fmt.Errorf("target stream has %d bytes left unconsumed", b)
-	}
-
-	fmt.Printf("Delta generation complete. Total size: %d\n", totalDeltaSize)
-	return nil
-}
-
-func applyHdiffzDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap, targetSnap string, deltaFile *os.File, mksqfsHdrArgs []string) error {
-	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
-
-	// Start Source Stream (unsquashfs)
-	// We read FROM this pipe
-	// Output to stdout '-', -pf stands for pseudo-file representation
-	unsquashSrcArg := append([]string{}, unsquashfsTuningApply...)
-	unsquashSrcArg = append(unsquashSrcArg, "-no-progress", "-pf", "-", sourceSnap)
-	unsquashCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/unsquashfs", unsquashSrcArg...)
-	if err != nil {
-		return fmt.Errorf("cannot find unsquashfs: %w", err)
-	}
-	pr, pw, err := os.Pipe()
-	if err != nil {
-		return fmt.Errorf("failed to create source pipe: %w", err)
-	}
-	defer pr.Close()
-	unsquashCmd.Stdout = pw
-
-	// Wrap source in a buffered reader for efficient seeking/skipping
-	sourceReader := bufio.NewReaderSize(pr, CopyBufferSize)
-
-	// Source from stdin (-), create targetSnap, pseudo-file from stdin
-	// (-pf -), not append to existing filesystem, quiet, append additional
-	// args built from our header.
-	mksquashArgs := append([]string{
-		"-", targetSnap, "-pf", "-", "-noappend", "-quiet",
-	}, mksqfsHdrArgs...)
-	mksquashArgs = append(mksquashArgs, mksquashfsTuningApply...)
-	mksquashCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/mksquashfs", mksquashArgs...)
-	if err != nil {
-		return fmt.Errorf("cannot find mksquashfs: %w", err)
-	}
-	// Shows progress when creating squashfs.
-	// TODO make this happen only in "snap apply" command
-	mksquashCmd.Stdout = os.Stdout
-
-	targetStdin, err := mksquashCmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create target stdin pipe: %w", err)
-	}
-
-	// prepare hpatchz
-	hpatchzCmd, err := snapdtoolCommandFromSystemSnap("/usr/bin/hpatchz", "")
-	if err != nil {
-		return fmt.Errorf("cannot find hpatchz: %w", err)
-	}
-
-	hpatchzPath := hpatchzCmd.Path
-
-	// unsquash source
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		defer pw.Close()
-		if err := runWithContext(ctx, unsquashCmd); err != nil {
-			select {
-			case errCh <- wrapErr(err, "unsquashfs"):
-			default:
-			}
-			cancel()
-		}
-	}()
-
-	// mksquash target
-	go func() {
-		defer wg.Done()
-		if err := runWithContext(ctx, mksquashCmd); err != nil {
-			select {
-			case errCh <- wrapErr(err, "mksquashfs"):
-			default:
-			}
-			cancel()
-		}
-	}()
-
-	// Parse Source Header
-	// We need the source entries to resolve "Identical" file references (negative indices)
-	sourceEntries, sourceHeaderBuff, err := parsePseudoStream(sourceReader)
-	if err != nil {
-		return fmt.Errorf("failed to parse source header: %w", err)
-	}
-	sourceHeaderSize := int64(sourceHeaderBuff.Len())
-
-	// Reconstruct and Write Target Header
-	// The first segment in the delta file is ALWAYS the header patch
-	// Read Header Patch Metadata: [Offset (0)][SourceSize][PatchSize]
-	var headOffset, headSrcSize, headPatchSize int64
-	if err := binary.Read(deltaFile, binary.LittleEndian, &headOffset); err != nil {
-		return fmt.Errorf("failed to read header delta offset: %w", err)
-	}
-	if err := binary.Read(deltaFile, binary.LittleEndian, &headSrcSize); err != nil {
-		return fmt.Errorf("failed to read header source size: %w", err)
-	}
-	if err := binary.Read(deltaFile, binary.LittleEndian, &headPatchSize); err != nil {
-		return fmt.Errorf("failed to read header patch size: %w", err)
-	}
-
-	// Prepare reusable mem Processors for patch applying
-	srcMem, err := NewReusableMemFD("src-seg")
-	if err != nil {
-		return fmt.Errorf("failed to prepare reusable memFd: %w", err)
-	}
-	defer srcMem.Close()
-	targetMem, err := NewReusableMemFD("target_seg")
-	if err != nil {
-		return fmt.Errorf("failed to prepare reusable memFd: %w", err)
-	}
-	defer targetMem.Close()
-
-	patchMem, err := NewReusableMemFD("seg-patch")
-	if err != nil {
-		return fmt.Errorf("failed to prepare reusable memFd: %w", err)
-	}
-	defer patchMem.Close()
-
-	// get header patch into memory
-	if _, err := copyNBuffer(patchMem.File, deltaFile, headPatchSize); err != nil {
-		return fmt.Errorf("failed to read header patch data: %w", err)
-	}
-
-	// get source header to the memory
-	if _, err := copyNBuffer(srcMem.File, sourceHeaderBuff, sourceHeaderSize); err != nil {
-		return fmt.Errorf("failed to copy source header data: %w", err)
-	}
-
-	// Apply Patch: Source Header + Patch -> Target Header
-	if err := applyHdiffzPatch(ctx, srcMem.Path, patchMem.Path, targetMem.Path, hpatchzPath); err != nil {
-		return fmt.Errorf("failed to patch header: %w", err)
-	}
-
-	// We don't need the raw source header text anymore, so return to pool
-	bufferPool.Put(sourceHeaderBuff)
-
-	// Write Reconstructed Header to mksquashfs
-	// This tells mksquashfs what files are coming
-	if _, err := copyBuffer(targetStdin, targetMem.File); err != nil {
-		return fmt.Errorf("failed to write target header to mksquashfs: %w", err)
-	}
-
-	// Parse the *Target* header we just generated so we know the order of files expected
-	// We need to rewind the targetMem to parse it
-	targetMem.File.Seek(0, 0)
-	targetHeadReader := bufio.NewReader(targetMem.File)
-	targetEntries, _, err := parsePseudoStream(targetHeadReader)
-	if err != nil {
-		return fmt.Errorf("failed to parse reconstructed target header: %w", err)
-	}
-	fmt.Printf("Reconstructing %d entries...\n", len(targetEntries))
-
-	// Process Stream Loop
-	// we can process delta stream directly, it has all the information we need
-	// but using reconstructed target header as entry for the loop
-	// gives us debug info at which file we failed to apply patch
-	srcMem.Reset()
-	patchMem.Reset()
-	targetMem.Reset()
-	sourceReadCursor := sourceHeaderSize
-
-LOOP:
-	for _, entry := range targetEntries {
-		if ctx.Err() != nil {
-			break LOOP
-		}
-		// Read Control Int64
-		var controlVal int64
-		if err := binary.Read(deltaFile, binary.LittleEndian, &controlVal); err != nil {
-			errCh <- fmt.Errorf("failed to read control value for %s: %w", entry.FilePath, err)
-			cancel()
-			break LOOP
-		}
-		if controlVal <= 0 {
-			// source file is idential to target file, just stream it
-			// control value is negative index to the source header
-			sourceIndex := int(-controlVal)
-			srcEntry := sourceEntries[sourceIndex]
-
-			// stream can only move forward, do sanity check we haven't advanced allready too far
-			neededOffset := srcEntry.DataOffset + sourceHeaderSize
-			if sourceReadCursor > neededOffset {
-				errCh <- fmt.Errorf("critical: source stream cursor (%d) passed needed offset (%d). Generator logic flaw or unsorted input", sourceReadCursor, neededOffset)
-				cancel()
-				break LOOP
-			}
-			// do we need to skip some data in the source stream?
-			skip := neededOffset - sourceReadCursor
-			if skip > 0 {
-				if _, err := copyNBuffer(io.Discard, sourceReader, skip); err != nil {
-					errCh <- fmt.Errorf("failed to skip data in the source: %w", err)
-					cancel()
-					break LOOP
-				}
-				sourceReadCursor += skip
-			}
-
-			// ready to pump data from source stream to -> mksquashfs
-			if _, err := copyNBuffer(targetStdin, sourceReader, srcEntry.DataSize); err != nil {
-				errCh <- fmt.Errorf("failed to copy source data for %s: [%w]", entry.FilePath, err)
-				cancel()
-				break LOOP
-			}
-			sourceReadCursor += srcEntry.DataSize
-
-		} else {
-			// source and tatget file differ, apply patch on the source
-			// controlVal becomes SourceOffset
-			srcOffset := controlVal
-			var srcSize, patchSize int64
-
-			if err := binary.Read(deltaFile, binary.LittleEndian, &srcSize); err != nil {
-				errCh <- err
-				cancel()
-				break LOOP
-			}
-			if err := binary.Read(deltaFile, binary.LittleEndian, &patchSize); err != nil {
-				errCh <- err
-				cancel()
-				break LOOP
-			}
-			// prepare patch file
-			patchMem.Reset()
-			if _, err := copyNBuffer(patchMem.File, deltaFile, patchSize); err != nil {
-				errCh <- fmt.Errorf("failed to read patch data: %w", err)
-				cancel()
-				break LOOP
-			}
-
-			// Prepare Source Segment
-			srcMem.Reset()
-			if srcSize > 0 {
-				// align source stream to what patch applies to
-				// mostl likely files from source are not present in the target
-				// !! sourceOffset in delta includes source header size for consistency with header delta which has offset 0
-				// offset values in the header start at 0 after the header ends
-
-				if sourceReadCursor > srcOffset {
-					errCh <- fmt.Errorf("critical: source cursor advanced too far for patch %s", entry.FilePath)
-					cancel()
-					break LOOP
-				}
-
-				skip := srcOffset - sourceReadCursor
-				if skip > 0 {
-					if _, err := copyNBuffer(io.Discard, sourceReader, skip); err != nil {
-						errCh <- fmt.Errorf("failed to skip data in the source: %w", err)
-						cancel()
-						break LOOP
-					}
-					sourceReadCursor += skip
-				}
-
-				// Read from stream to MemFD
-				if _, err := copyNBuffer(srcMem.File, sourceReader, srcSize); err != nil {
-					errCh <- fmt.Errorf("failed to extract source segment for patch: %w", err)
-					cancel()
-					break LOOP
-				}
-				sourceReadCursor += srcSize
-			}
-
-			// 3. Apply Patch
-			targetMem.Reset()
-			// if srcSize is 0, hpatchz treats it as creating a new file from patch
-			if err := applyHdiffzPatch(ctx, srcMem.Path, patchMem.Path, targetMem.Path, hpatchzPath); err != nil {
-				errCh <- fmt.Errorf("failed to patch file %s: %w", entry.FilePath, err)
-				cancel()
-				break LOOP
-			}
-			// write reconstructed result to mksquashfs
-			// DEBUG: fmt.Printf("%s\t(from %d bytes delta)\n", entry.FilePath, patchSize)
-			if _, err := copyBuffer(targetStdin, targetMem.File); err != nil {
-				errCh <- fmt.Errorf("failed to write patched data to mksquashfs: %w", err)
-				cancel()
-				break LOOP
-			}
-		}
-	}
-
-	targetStdin.Close() // Close stdin to signal EOF to mksquashfs
-	wg.Wait()
-	close(errCh)
-
-	if err := <-errCh; err != nil {
-		return err
-	}
-	return nil
-}
-
 // --- Shared Helpers ---
-
-// writeHdiffzToltaStream
-func writeHdiffzToDeltaStream(ctx context.Context, deltaFile *os.File, sourceOffset, sourceSize int64, source, target, diff *ReusableMemFD, hdiffzPath string) (int64, error) {
-
-	// Files differ, run hdiffz, use the /proc paths which remain valid for the reused FDs
-	hdiffzArgs := append(hdiffzTuning, "-f", source.Path, target.Path, diff.Path)
-	hdiffzCmd := exec.CommandContext(ctx, hdiffzPath, hdiffzArgs...)
-	if err := runWithContext(ctx, hdiffzCmd); err != nil {
-		return 0, fmt.Errorf("hdiffz failed: %v", err)
-	}
-
-	headerBuf := bufferPool.Get().(*bytes.Buffer)
-	headerBuf.Reset()
-	defer bufferPool.Put(headerBuf)
-
-	// Get segment size
-	st, err := diff.File.Stat()
-	if err != nil {
-		return 0, err
-	}
-	segSize := st.Size()
-
-	binary.Write(headerBuf, binary.LittleEndian, int64(sourceOffset))
-	binary.Write(headerBuf, binary.LittleEndian, int64(sourceSize))
-	binary.Write(headerBuf, binary.LittleEndian, int64(segSize))
-
-	if _, err := deltaFile.Write(headerBuf.Bytes()); err != nil {
-		return 0, err
-	}
-
-	// Rewind segment file
-	if _, err := diff.File.Seek(0, 0); err != nil {
-		return 0, err
-	}
-
-	// Copy data
-	if _, err := copyBuffer(deltaFile, diff.File); err != nil {
-		return 0, err
-	}
-	return segSize, nil
-}
 
 func applyHdiffzPatch(ctx context.Context, oldPath, diffPath, outPath, hpatchzPath string) error {
 	hpatchzArgs := append(hpatchzTuning, "-f", oldPath, diffPath, outPath)
@@ -1891,7 +1252,7 @@ func (g *Group) Go(f func() error) {
 // The command line is described once, as data, and both halves are built from
 // that description: the flag sets that parse the options and the help that
 // prints them. The help used to be a hand-written list and had fallen a whole
-// delta format behind -- it documented --hdiffz and --xdelta3 and nothing else
+// delta format behind -- it documented only the pseudo-file formats
 // -- and printing it from the same table that registers the flags is what stops
 // that happening again.
 //
@@ -2016,7 +1377,7 @@ type cli struct {
 	commands []*command
 
 	genSource, genTarget, genDelta                  string
-	xdelta3Tool, hdiffzTool, blocksFormat           bool
+	xdelta3Tool, blocksFormat                       bool
 	genMaxRun, genMinSaving                         int
 	genNoVerify, genNoPatchRuns, genNoPathMatch     bool
 	genRunLog                                       bool
@@ -2070,10 +1431,6 @@ func newCLI() *cli {
 					snapDeltaFormatBlocks + " format: allows reassembly without",
 					"recompressing unchanged blocks (enables tuning below)",
 				}, bind: yes(&c.blocksFormat)},
-				{long: "hdiffz", help: []string{
-					snapDeltaFormatHdiffz + " format: hdiffz over pseudo-file,",
-					"processed one file at a time",
-				}, bind: yes(&c.hdiffzTool)},
 				{long: "xdelta3", help: []string{
 					snapDeltaFormatXdelta3 + " format: xdelta3 over pseudo-file",
 				}, bind: yes(&c.xdelta3Tool)},
@@ -2300,9 +1657,9 @@ func main() {
 		// Exactly one format, so that a delta is never generated in a format
 		// the caller did not ask for -- and, with the check above it, so that
 		// tuning meant for one is never quietly dropped on another.
-		if n := btoi(c.blocksFormat) + btoi(c.hdiffzTool) + btoi(c.xdelta3Tool); n != 1 {
+		if n := btoi(c.blocksFormat) + btoi(c.xdelta3Tool); n != 1 {
 			cmd.fs.Usage()
-			log.Fatalf("Pick exactly one delta format for 'generate': --blocks, --hdiffz or --xdelta3 (given %d)", n)
+			log.Fatalf("Pick exactly one delta format for 'generate': --blocks or --xdelta3 (given %d)", n)
 		}
 		if bad := cmd.misplacedOption(c.blocksFormat); bad != "" {
 			cmd.fs.Usage()
@@ -2323,12 +1680,8 @@ func main() {
 			})
 			break
 		}
-		deltaFormat := SnapHdiffzFormat
-		if c.xdelta3Tool {
-			deltaFormat = SnapXdelta3Format
-		}
-		fmt.Printf("requested delta tool: 0x%X\n", deltaFormat)
-		err = GenerateDelta(c.genSource, c.genTarget, c.genDelta, deltaFormat)
+		fmt.Printf("requested delta tool: 0x%X\n", SnapXdelta3Format)
+		err = GenerateDelta(c.genSource, c.genTarget, c.genDelta, SnapXdelta3Format)
 
 	case "apply":
 		if c.appSource == "" || c.appTarget == "" || c.appDelta == "" {
