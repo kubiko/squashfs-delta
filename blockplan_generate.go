@@ -103,7 +103,9 @@ type blockPlanGenOpts struct {
 	// blocks that are valid and wrong.
 	Comp Compressor
 	// Jobs is how many blocks the derived compressor may work on at once.
-	// Zero or less means every core.
+	// Zero or less means every core, which is what the command line asks for:
+	// generating runs on a build machine with no memory budget to keep, so
+	// there is nothing for a caller to trade and no flag to trade it with.
 	Jobs int
 	// HdiffzPath and HpatchzPath are the patch tool binaries; empty means
 	// look them up.

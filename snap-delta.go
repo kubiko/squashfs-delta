@@ -1888,25 +1888,136 @@ func (g *Group) Go(f func() error) {
 
 // --- Main ---
 
-// cli is every option the command line binds, together with the flag sets that
-// bind them.
+// The command line is described once, as data, and both halves are built from
+// that description: the flag sets that parse the options and the help that
+// prints them. The help used to be a hand-written list and had fallen a whole
+// delta format behind -- it documented --hdiffz and --xdelta3 and nothing else
+// -- and printing it from the same table that registers the flags is what stops
+// that happening again.
 //
-// It exists so that the help text and the parser cannot drift apart. The help
-// used to be a hand-written list and had fallen a whole delta format behind: it
-// described --hdiffz and --xdelta3 and nothing else, with no sign of --blocks,
-// --stats, the cost-model flags or either development subcommand. Printing the
-// flag sets themselves means every option is documented by the same string the
-// parser registers it with, and a new one appears in the help without anybody
-// having to describe it twice.
+// The table also carries which options belong to which delta format, which the
+// help shows and the parser enforces: --no-verify and the rest of the tuning
+// mean nothing without --blocks, and silently ignoring them would let a sweep
+// measure a setting it never actually applied.
+
+// option is one command-line option: how it is spelled, what it takes, and what
+// the help says about it.
+type option struct {
+	// short is the one-letter spelling, empty when there is none; long is the
+	// full one. Go's flag package accepts either with one dash or two, which
+	// is why the help can show the double-dash form the usage lines use.
+	short, long string
+	// arg names the value in the help and is empty for a boolean.
+	arg string
+	// help is the description, one entry per line: the first is printed beside
+	// the option and the rest indented underneath it.
+	help []string
+	// bind registers this option with a flag set under one name. It is called
+	// once per spelling, so the short form aliases the same variable rather
+	// than becoming a second one.
+	bind func(fs *flag.FlagSet, name string)
+}
+
+// names is the option as the help spells it, without padding.
+func (o option) names() string {
+	n := "--" + o.long
+	if o.arg != "" {
+		n += " " + o.arg
+	}
+	return n
+}
+
+func (o option) register(fs *flag.FlagSet) {
+	o.bind(fs, o.long)
+	if o.short != "" {
+		o.bind(fs, o.short)
+	}
+}
+
+// optionGroup is a heading in the help and, when blocksOnly is set, a rule the
+// parser enforces.
+type optionGroup struct {
+	title   string
+	options []option
+	// blocksOnly marks options that only the block-plan format reads. Passing
+	// one without --blocks is refused rather than ignored.
+	blocksOnly bool
+}
+
+// command is one operation: how the help introduces it, how it is invoked, and
+// what it takes.
+type command struct {
+	name string
+	// brief is its line in the COMMANDS list; summary is the sentence under
+	// its own heading.
+	brief, summary string
+	// usage is the invocation line, without the program name.
+	usage  string
+	groups []optionGroup
+	fs     *flag.FlagSet
+}
+
+func (c *command) hasShortForms() bool {
+	for _, g := range c.groups {
+		for _, o := range g.options {
+			if o.short != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// helpLayout is where an option's name starts and where its description does.
+// The name column leaves room for a short form only in a command that has one,
+// which is what keeps a command of plain long options from being indented past
+// nothing.
+func (c *command) helpLayout() (nameCol, helpCol int) {
+	nameCol = 2
+	if c.hasShortForms() {
+		nameCol += 4
+	}
+	return nameCol, nameCol + 22
+}
+
+// setFlags is the set of option names actually given on the command line, which
+// is how an option that only applies in one mode can be refused when it was
+// passed rather than merely when it is non-zero: zero is a meaningful value for
+// several of them.
+func (c *command) setFlags() map[string]bool {
+	set := map[string]bool{}
+	c.fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	return set
+}
+
+// misplacedOption returns the first option the caller gave that belongs to a
+// group it did not select, or "".
+func (c *command) misplacedOption(blocks bool) string {
+	if blocks {
+		return ""
+	}
+	set := c.setFlags()
+	for _, g := range c.groups {
+		if !g.blocksOnly {
+			continue
+		}
+		for _, o := range g.options {
+			if set[o.long] || (o.short != "" && set[o.short]) {
+				return "--" + o.long
+			}
+		}
+	}
+	return ""
+}
+
+// cli is the whole command line: the commands, and the variables their options
+// bind to.
 type cli struct {
-	generate *flag.FlagSet
-	apply    *flag.FlagSet
-	selftest *flag.FlagSet
-	inspect  *flag.FlagSet
+	commands []*command
 
 	genSource, genTarget, genDelta                  string
 	xdelta3Tool, hdiffzTool, blocksFormat           bool
-	genJobs, genMaxRun, genMinSaving                int
+	genMaxRun, genMinSaving                         int
 	genNoVerify, genNoPatchRuns, genNoPathMatch     bool
 	genRunLog                                       bool
 	genWindowRatio, genMinSavingRate, genWindowBack float64
@@ -1915,151 +2026,231 @@ type cli struct {
 	appReport                      bool
 	appMaxRun, appJobs             int
 
-	stSample, stJobs int
-}
-
-// subcommand is one operation as the help prints it: what it is called, what it
-// takes after its options, and which flag set holds those options.
-type subcommand struct {
-	name  string
-	args  string
-	brief string
-	fs    *flag.FlagSet
-}
-
-// subcommands lists the operations in the order the help prints them, the two
-// that generate and apply deltas first and the two development ones after.
-func (c *cli) subcommands() []subcommand {
-	return []subcommand{
-		{"generate", "", "generate a delta between a source and a target snap", c.generate},
-		{"apply", "", "apply a delta to the source, reconstructing the target", c.apply},
-		{"selftest", "<image>...", "check that the local compressor reproduces an image's own blocks", c.selftest},
-		{"inspect", "<image>...", "dump the byte layout of one or more squashfs images", c.inspect},
-	}
+	stSample int
 }
 
 func newCLI() *cli {
-	c := &cli{
-		generate: flag.NewFlagSet("generate", flag.ExitOnError),
-		apply:    flag.NewFlagSet("apply", flag.ExitOnError),
-		selftest: flag.NewFlagSet("selftest", flag.ExitOnError),
-		inspect:  flag.NewFlagSet("inspect", flag.ExitOnError),
+	c := &cli{}
+	str := func(p *string, def string) func(*flag.FlagSet, string) {
+		return func(fs *flag.FlagSet, name string) { fs.StringVar(p, name, def, "") }
+	}
+	num := func(p *int, def int) func(*flag.FlagSet, string) {
+		return func(fs *flag.FlagSet, name string) { fs.IntVar(p, name, def, "") }
+	}
+	frac := func(p *float64, def float64) func(*flag.FlagSet, string) {
+		return func(fs *flag.FlagSet, name string) { fs.Float64Var(p, name, def, "") }
+	}
+	yes := func(p *bool) func(*flag.FlagSet, string) {
+		return func(fs *flag.FlagSet, name string) { fs.BoolVar(p, name, false, "") }
 	}
 
-	// The three file arguments are spelled long and short. The short forms
-	// are registered as separate flags, so they are described as shorthands
-	// rather than repeating the long form's text in the help.
-	c.generate.StringVar(&c.genSource, "source", "", "source snap file (required)")
-	c.generate.StringVar(&c.genSource, "s", "", "shorthand for -source")
-	c.generate.StringVar(&c.genTarget, "target", "", "target snap file (required)")
-	c.generate.StringVar(&c.genTarget, "t", "", "shorthand for -target")
-	c.generate.StringVar(&c.genDelta, "delta", "", "delta output file (required)")
-	c.generate.StringVar(&c.genDelta, "d", "", "shorthand for -delta")
-	c.generate.BoolVar(&c.blocksFormat, "blocks", false, "generate a "+snapDeltaFormatBlocks+" delta, which the applier can assemble without recompressing unchanged blocks")
-	c.generate.BoolVar(&c.hdiffzTool, "hdiffz", false, "generate a "+snapDeltaFormatHdiffz+" delta: hdiffz over a squashfs pseudo-file definition, one file at a time because the tool does not stream")
-	c.generate.BoolVar(&c.xdelta3Tool, "xdelta3", false, "generate a "+snapDeltaFormatXdelta3+" delta: xdelta3 over a squashfs pseudo-file definition")
-	c.generate.IntVar(&c.genJobs, "jobs", 0, "blocks the compressor may work on at once, which is what uses the machine's cores (0 = one per core). Each job holds its own encoder state and buffers, so raising it raises peak memory too")
-	c.generate.IntVar(&c.genJobs, "j", 0, "shorthand for -jobs")
-	c.generate.IntVar(&c.genMaxRun, "max-run", 0, "cap on the plaintext one patch run reconstructs, which bounds apply memory (0 = default)")
-	c.generate.BoolVar(&c.genNoVerify, "no-verify", false, "skip running the applier over the finished delta (--blocks only)")
-	// The six that follow drive the cost model from the command line, which is
-	// how its defaults were measured; nothing but a sweep should pass them. The
-	// run log is how a sweep's result gets read: an aggregate report says what a
-	// delta cost, not which runs cost it.
-	c.generate.BoolVar(&c.genNoPatchRuns, "no-patch-runs", false, "ship every changed block as a literal, asking the device for no data-block compression at all")
-	c.generate.BoolVar(&c.genNoPathMatch, "no-path-match", false, "anchor patch runs by source offset alone, ignoring which file a block belongs to")
-	c.generate.Float64Var(&c.genWindowRatio, "window-ratio", 0, "source window size as a multiple of a run's plaintext (0 = default)")
-	c.generate.Float64Var(&c.genMinSavingRate, "min-saving-rate", 0, "delta bytes a run must save per byte of plaintext it makes the device compress (0 = default)")
-	c.generate.IntVar(&c.genMinSaving, "min-saving", -1, "fewest delta bytes a run must save to be worth compressing for at all (-1 = default, 0 = no floor)")
-	c.generate.Float64Var(&c.genWindowBack, "window-back", -1, "fraction of a source window placed before its anchor rather than after it (-1 = default)")
-	c.generate.BoolVar(&c.genRunLog, "run-log", false, "print one line per patch run on stderr: its plaintext, its window and what the patch cost")
+	jobsHelp := []string{
+		"Blocks the compressor may work on at once, which is",
+		"what uses the machine's cores (0 = one per core).",
+		"Each job holds its own encoder state and buffers, so",
+		"raising it raises peak memory too",
+	}
 
-	c.apply.StringVar(&c.appSource, "source", "", "source snap file (required)")
-	c.apply.StringVar(&c.appSource, "s", "", "shorthand for -source")
-	c.apply.StringVar(&c.appTarget, "target", "", "reconstructed snap file to write (required)")
-	c.apply.StringVar(&c.appTarget, "t", "", "shorthand for -target")
-	c.apply.StringVar(&c.appDelta, "delta", "", "delta input file (required)")
-	c.apply.StringVar(&c.appDelta, "d", "", "shorthand for -delta")
-	c.apply.BoolVar(&c.appReport, "stats", false, "report what the apply cost: instructions, bytes copied and compressed, peak memory")
-	c.apply.IntVar(&c.appMaxRun, "max-run", 0, "refuse a delta whose patch runs need more than this many bytes at once (0 = accept any)")
-	c.apply.IntVar(&c.appJobs, "jobs", 0, "blocks the compressor may work on at once, which is what uses the machine's cores (0 = one per core). Each job holds its own encoder state and buffers, so raising it raises peak memory too")
-	c.apply.IntVar(&c.appJobs, "j", 0, "shorthand for -jobs")
+	c.commands = []*command{{
+		name:    "generate",
+		brief:   "Generate a delta between a source and target snap",
+		summary: "Generate a delta between source and target snaps.",
+		usage:   "generate --<format> -s <source> -t <target> -d <delta> [options]",
+		groups: []optionGroup{{
+			title: "REQUIRED",
+			options: []option{
+				{short: "s", long: "source", arg: "<file>", help: []string{"Source snap file"}, bind: str(&c.genSource, "")},
+				{short: "t", long: "target", arg: "<file>", help: []string{"Target snap file"}, bind: str(&c.genTarget, "")},
+				{short: "d", long: "delta", arg: "<file>", help: []string{"Delta output file"}, bind: str(&c.genDelta, "")},
+			},
+		}, {
+			title: "DELTA FORMAT (pick exactly one)",
+			options: []option{
+				{long: "blocks", help: []string{
+					snapDeltaFormatBlocks + " format: allows reassembly without",
+					"recompressing unchanged blocks (enables tuning below)",
+				}, bind: yes(&c.blocksFormat)},
+				{long: "hdiffz", help: []string{
+					snapDeltaFormatHdiffz + " format: hdiffz over pseudo-file,",
+					"processed one file at a time",
+				}, bind: yes(&c.hdiffzTool)},
+				{long: "xdelta3", help: []string{
+					snapDeltaFormatXdelta3 + " format: xdelta3 over pseudo-file",
+				}, bind: yes(&c.xdelta3Tool)},
+			},
+		}, {
+			// These drive the cost model from the command line, which is how
+			// its defaults were measured; nothing but a sweep should pass them.
+			// The run log is how a sweep's result gets read: an aggregate
+			// report says what a delta cost, not which runs cost it.
+			title:      "BLOCKS MODE TUNING (valid only with --blocks)",
+			blocksOnly: true,
+			options: []option{
+				{long: "max-run", arg: "<int>", help: []string{
+					"Cap plaintext reconstructed in one patch run (default: 0)",
+				}, bind: num(&c.genMaxRun, 0)},
+				{long: "min-saving", arg: "<int>", help: []string{
+					"Min bytes a run must save to justify compression",
+					"(-1 = default, 0 = no floor)",
+				}, bind: num(&c.genMinSaving, -1)},
+				{long: "min-saving-rate", arg: "<f>", help: []string{
+					"Min bytes saved per byte compressed (default: 0)",
+				}, bind: frac(&c.genMinSavingRate, 0)},
+				{long: "window-ratio", arg: "<f>", help: []string{
+					"Source window size as a multiple of run plaintext (default: 0)",
+				}, bind: frac(&c.genWindowRatio, 0)},
+				{long: "window-back", arg: "<f>", help: []string{
+					"Window fraction placed before anchor (-1 = default)",
+				}, bind: frac(&c.genWindowBack, -1)},
+				{long: "no-patch-runs", help: []string{
+					"Ship all changed blocks as literals (no device compression)",
+				}, bind: yes(&c.genNoPatchRuns)},
+				{long: "no-path-match", help: []string{
+					"Anchor patch runs by source offset alone, ignoring filenames",
+				}, bind: yes(&c.genNoPathMatch)},
+				{long: "no-verify", help: []string{
+					"Skip verification pass over finished delta",
+				}, bind: yes(&c.genNoVerify)},
+				{long: "run-log", help: []string{
+					"Log run details (plaintext, window, cost) to stderr",
+				}, bind: yes(&c.genRunLog)},
+			},
+		}},
+	}, {
+		name:    "apply",
+		brief:   "Apply a delta to a source snap to reconstruct the target",
+		summary: "Apply a delta to a source snap, reconstructing the target image.",
+		usage:   "apply -s <source> -d <delta> -t <target> [options]",
+		groups: []optionGroup{{
+			title: "REQUIRED",
+			options: []option{
+				{short: "s", long: "source", arg: "<file>", help: []string{"Source snap file"}, bind: str(&c.appSource, "")},
+				{short: "d", long: "delta", arg: "<file>", help: []string{"Delta input file"}, bind: str(&c.appDelta, "")},
+				{short: "t", long: "target", arg: "<file>", help: []string{"Reconstructed snap output file"}, bind: str(&c.appTarget, "")},
+			},
+		}, {
+			title: "BLOCKS DELTA OPTIONS (ignored for other formats)",
+			options: []option{
+				{short: "j", long: "jobs", arg: "<int>", help: jobsHelp, bind: num(&c.appJobs, 0)},
+				{long: "max-run", arg: "<int>", help: []string{
+					"Refuse deltas requiring more than N bytes at once (0 = accept any)",
+				}, bind: num(&c.appMaxRun, 0)},
+				{long: "stats", help: []string{
+					"Report instructions, bytes copied/compressed, and peak memory",
+				}, bind: yes(&c.appReport)},
+			},
+		}},
+	}, {
+		// The two development commands for the block-plan format: 'selftest'
+		// is the gate that the local compressor reproduces an image's own
+		// blocks byte for byte, and 'inspect' dumps a layout.
+		name:    "selftest",
+		brief:   "Verify local compressor reproduces an image's own blocks",
+		summary: "Check that the local compressor reproduces an image's own blocks.",
+		usage:   "selftest [options] <image>...",
+		groups: []optionGroup{{
+			title: "OPTIONS",
+			options: []option{
+				{long: "sample", arg: "<int>", help: []string{
+					"Check only N data blocks spread across image (default: 0 = all)",
+				}, bind: num(&c.stSample, 0)},
+			},
+		}},
+	}, {
+		name:    "inspect",
+		brief:   "Dump the byte layout of one or more squashfs images",
+		summary: "Dump the byte layout of one or more squashfs images.",
+		usage:   "inspect <image>...",
+	}}
 
-	// Development subcommands for the block-plan format: 'inspect' dumps an
-	// image's layout, 'selftest' is the gate that the local compressor
-	// reproduces the image's own blocks byte for byte.
-	c.selftest.IntVar(&c.stSample, "sample", 0, "check only this many data blocks, spread across the image (0 = all)")
-	c.selftest.IntVar(&c.stJobs, "jobs", 0, "blocks the compressor may work on at once, which is what uses the machine's cores (0 = one per core). Each job holds its own encoder state and buffers, so raising it raises peak memory too")
-	c.selftest.IntVar(&c.stJobs, "j", 0, "shorthand for -jobs")
-
-	for _, s := range c.subcommands() {
-		s := s
-		s.fs.Usage = func() { c.printCommand(os.Stderr, s) }
+	for _, cmd := range c.commands {
+		cmd.fs = flag.NewFlagSet(cmd.name, flag.ExitOnError)
+		for _, g := range cmd.groups {
+			for _, o := range g.options {
+				o.register(cmd.fs)
+			}
+		}
+		cmd.fs.Usage = func() { c.printCommand(os.Stderr, cmd) }
 	}
 	return c
 }
 
-// hasOptions reports whether a subcommand binds any flags, which is what
-// decides whether its usage line mentions options at all.
-func (s subcommand) hasOptions() bool {
-	n := 0
-	s.fs.VisitAll(func(*flag.Flag) { n++ })
-	return n > 0
+func (c *cli) command(name string) *command {
+	for _, cmd := range c.commands {
+		if cmd.name == name {
+			return cmd
+		}
+	}
+	return nil
 }
 
-// usageLine is how a subcommand is invoked, without its option list.
-func (s subcommand) usageLine(appName string) string {
-	line := appName + " " + s.name
-	if s.hasOptions() {
-		line += " [options]"
+// appName is how the help spells the program, which is whatever it was invoked
+// as rather than a hard-coded name.
+func appName() string { return filepath.Base(os.Args[0]) }
+
+const helpRule = "--------------------------------------------------------------------------------"
+
+// printCommand prints one operation's section: what it does, how it is invoked,
+// and every option it takes under its own heading.
+func (c *cli) printCommand(w io.Writer, cmd *command) {
+	fmt.Fprintf(w, "%s %s:\n", appName(), cmd.name)
+	fmt.Fprintf(w, "  %s\n\n", cmd.summary)
+	fmt.Fprintln(w, "USAGE:")
+	fmt.Fprintf(w, "  %s %s\n", appName(), cmd.usage)
+	nameCol, helpCol := cmd.helpLayout()
+	for _, g := range cmd.groups {
+		fmt.Fprintf(w, "\n%s:\n", g.title)
+		for _, o := range g.options {
+			// The short form sits in its own column so the long forms line up
+			// whether or not an option has one.
+			lead := strings.Repeat(" ", nameCol)
+			if o.short != "" {
+				lead = "  -" + o.short + ", "
+			}
+			name := lead + o.names()
+			for i, line := range o.help {
+				if i == 0 {
+					fmt.Fprintf(w, "%-*s%s\n", max(helpCol, len(name)+1), name, line)
+					continue
+				}
+				fmt.Fprintf(w, "%s%s\n", strings.Repeat(" ", helpCol), line)
+			}
+		}
 	}
-	if s.args != "" {
-		line += " " + s.args
-	}
-	return line
 }
 
-// printCommand prints one operation: how it is invoked and every option it
-// takes, straight out of the flag set that parses them.
-func (c *cli) printCommand(w io.Writer, s subcommand) {
-	fmt.Fprintf(w, "%s\n", s.usageLine(filepath.Base(os.Args[0])))
-	if s.hasOptions() {
-		s.fs.SetOutput(w)
-		s.fs.PrintDefaults()
-	}
-}
-
-// printUsage prints the whole help: what the tool is, the operations, and every
-// option of every operation.
+// printUsage prints the whole help: what the tool is, the commands, and each
+// command's own section.
 func (c *cli) printUsage(w io.Writer, msg string) {
-	appName := filepath.Base(os.Args[0])
 	if msg != "" {
 		fmt.Fprintln(w, msg)
 		fmt.Fprintln(w)
 	}
-	fmt.Fprintln(w, "Generate / apply 'smart' delta between source and target squashfs images.")
+	fmt.Fprintln(w, "Generate or apply smart deltas between source and target squashfs images.")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintf(w, "\t%s <operation> [options]\n", appName)
+	fmt.Fprintln(w, "USAGE:")
+	fmt.Fprintf(w, "  %s <command> [options]\n", appName())
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Operations:")
-	for _, s := range c.subcommands() {
-		fmt.Fprintf(w, "\t%-9s %s\n", s.name, s.brief)
-	}
-	for _, s := range c.subcommands() {
-		fmt.Fprintln(w)
-		c.printCommand(w, s)
+	fmt.Fprintln(w, "COMMANDS:")
+	for _, cmd := range c.commands {
+		fmt.Fprintf(w, "  %-11s %s\n", cmd.name, cmd.brief)
 	}
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Examples:")
-	fmt.Fprintf(w, "\t%s generate --blocks --source core22_2134.snap --target core22_2140.snap --delta core22-2134-2140.delta\n", appName)
-	fmt.Fprintf(w, "\t%s apply --stats --source core22_2134.snap --delta core22-2134-2140.delta --target rebuilt.snap\n", appName)
-	fmt.Fprintf(w, "\t%s selftest core22_2140.snap\n", appName)
+	fmt.Fprintf(w, "Run '%s <command> --help' for details on a specific command.\n", appName())
+	for _, cmd := range c.commands {
+		fmt.Fprintf(w, "\n%s\n", helpRule)
+		c.printCommand(w, cmd)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "EXAMPLES:")
+	fmt.Fprintf(w, "  %s generate --blocks -s core22_2134.snap -t core22_2140.snap -d core22.delta\n", appName())
+	fmt.Fprintf(w, "  %s apply --stats -s core22_2134.snap -d core22.delta -t rebuilt.snap\n", appName())
+	fmt.Fprintf(w, "  %s selftest core22_2140.snap\n", appName())
 }
 
-// usageAndExit prints the help and stops. A request for it succeeds; a usage
-// error is a failure, and the two go to different streams so that piping the
-// help somewhere does not mix it with a complaint.
+// usageAndExit prints the help and stops. A request for it succeeds and goes to
+// stdout; a usage error fails and goes to stderr, so piping the help somewhere
+// does not mix it with a complaint.
 func (c *cli) usageAndExit(msg string) {
 	if msg == "" {
 		c.printUsage(os.Stdout, "")
@@ -2069,23 +2260,56 @@ func (c *cli) usageAndExit(msg string) {
 	os.Exit(1)
 }
 
+// wantsHelp reports whether the arguments are asking for the help rather than
+// giving options. It runs before Parse so that an explicit request succeeds:
+// the flag package treats -h as a parse error and exits 2.
+func wantsHelp(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "-h", "--help", "-help", "help":
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	c := newCLI()
 	if len(os.Args) < 2 {
 		c.usageAndExit("Missing operation")
 	}
+	cmd := c.command(os.Args[1])
+	switch {
+	case os.Args[1] == "--help" || os.Args[1] == "-h" || os.Args[1] == "help":
+		c.usageAndExit("")
+	case cmd == nil:
+		c.usageAndExit(fmt.Sprintf("Unrecognised operation: %s", os.Args[1]))
+	case wantsHelp(os.Args[2:]):
+		c.printCommand(os.Stdout, cmd)
+		os.Exit(0)
+	}
+	cmd.fs.Parse(os.Args[2:])
 
 	var err error
-	switch os.Args[1] {
+	switch cmd.name {
 	case "generate":
-		c.generate.Parse(os.Args[2:])
 		if c.genSource == "" || c.genTarget == "" || c.genDelta == "" {
-			c.generate.Usage()
+			cmd.fs.Usage()
 			log.Fatal("Missing required parameters for 'generate'")
+		}
+		// Exactly one format, so that a delta is never generated in a format
+		// the caller did not ask for -- and, with the check above it, so that
+		// tuning meant for one is never quietly dropped on another.
+		if n := btoi(c.blocksFormat) + btoi(c.hdiffzTool) + btoi(c.xdelta3Tool); n != 1 {
+			cmd.fs.Usage()
+			log.Fatalf("Pick exactly one delta format for 'generate': --blocks, --hdiffz or --xdelta3 (given %d)", n)
+		}
+		if bad := cmd.misplacedOption(c.blocksFormat); bad != "" {
+			cmd.fs.Usage()
+			log.Fatalf("%s tunes the %s format and is only read with --blocks", bad, snapDeltaFormatBlocks)
 		}
 		if c.blocksFormat {
 			err = cmdGenerateBlocks(context.Background(), c.genSource, c.genTarget, c.genDelta, genCmdOpts{
-				Jobs:          c.genJobs,
 				MaxRun:        c.genMaxRun,
 				Verify:        !c.genNoVerify,
 				NoPatchRuns:   c.genNoPatchRuns,
@@ -2099,22 +2323,16 @@ func main() {
 			})
 			break
 		}
-		var deltaFormat DeltaFormat
-		if c.hdiffzTool {
-			deltaFormat = SnapHdiffzFormat
-		} else if c.xdelta3Tool {
+		deltaFormat := SnapHdiffzFormat
+		if c.xdelta3Tool {
 			deltaFormat = SnapXdelta3Format
-		} else {
-			c.generate.Usage()
-			log.Fatal("missing delta tool setting for generate operation")
 		}
 		fmt.Printf("requested delta tool: 0x%X\n", deltaFormat)
 		err = GenerateDelta(c.genSource, c.genTarget, c.genDelta, deltaFormat)
 
 	case "apply":
-		c.apply.Parse(os.Args[2:])
 		if c.appSource == "" || c.appTarget == "" || c.appDelta == "" {
-			c.apply.Usage()
+			cmd.fs.Usage()
 			log.Fatal("Missing required parameters for 'apply'")
 		}
 		if c.appReport {
@@ -2132,30 +2350,32 @@ func main() {
 		err = ApplyDelta(c.appSource, c.appDelta, c.appTarget, c.appJobs)
 
 	case "selftest":
-		c.selftest.Parse(os.Args[2:])
-		if c.selftest.NArg() == 0 {
-			c.selftest.Usage()
+		if cmd.fs.NArg() == 0 {
+			cmd.fs.Usage()
 			log.Fatal("Missing image arguments for 'selftest'")
 		}
-		err = cmdSelftest(context.Background(), c.selftest.Args(), c.stSample, c.stJobs)
+		// Every core: this recompresses whole images and has no memory budget
+		// to keep, which is the one thing that would argue for fewer.
+		err = cmdSelftest(context.Background(), cmd.fs.Args(), c.stSample, 0)
 
 	case "inspect":
-		c.inspect.Parse(os.Args[2:])
-		if c.inspect.NArg() == 0 {
-			c.inspect.Usage()
+		if cmd.fs.NArg() == 0 {
+			cmd.fs.Usage()
 			log.Fatal("Missing image arguments for 'inspect'")
 		}
-		err = cmdInspect(context.Background(), c.inspect.Args())
-
-	case "--help", "-h", "help":
-		c.usageAndExit("")
-
-	default:
-		c.usageAndExit(fmt.Sprintf("Unrecognised operation: %s", os.Args[1]))
+		err = cmdInspect(context.Background(), cmd.fs.Args())
 	}
 
 	if err != nil {
 		log.Fatalf("Operation failed: %v", err)
 	}
 	fmt.Println("Operation completed successfully.")
+}
+
+// btoi counts a set flag, for the "pick exactly one" check.
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
