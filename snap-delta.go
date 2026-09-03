@@ -17,7 +17,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -76,15 +75,10 @@ import (
 //
 // Reference for the squashfs superblock: https://dr-emann.github.io/squashfs
 
-type DeltaFormat int
-
 const (
-	// Identifiers for the formats in the API
-	Xdelta3Format DeltaFormat = iota
-	SnapXdelta3Format
-	SnapBlockPlanFormat
-
-	// Identifiers for the store
+	// Identifiers for the store, which are also how a format is named in
+	// the API: a caller passes the store's own string rather than a private
+	// enumeration that has to be mapped back to it.
 	xdelta3Format = "xdelta3"
 	// This follows compatibility labels conventions. First and second
 	// number represent format and tools versions respectively, and could
@@ -175,7 +169,7 @@ var (
 	mksquashfsTuningApply = []string{"-mem-percent", "3"}
 
 	// IO buffer size for efficient piping (1MB)
-	CopyBufferSize = 1024 * 1024
+	copyBufferSize = 1024 * 1024
 )
 
 // Fuzzy matching tuning parameters
@@ -225,7 +219,7 @@ func (h *SnapDeltaHeader) toBytes() ([]byte, error) {
 // newDeltaHeaderFromSnap builds a delta header. It takes modification_time,
 // compression_id, and flags from the squashfs superblock of targetSnap and
 // writes that in the corresponding delta header fields.
-func newDeltaHeaderFromSnap(targetSnap string, deltaFormat uint16) (*SnapDeltaHeader, error) {
+func newDeltaHeaderFromSnap(targetSnap string) (*SnapDeltaHeader, error) {
 	// we need to get some basic info from the target snap
 	f, err := os.Open(targetSnap)
 	if err != nil {
@@ -251,11 +245,12 @@ func newDeltaHeaderFromSnap(targetSnap string, deltaFormat uint16) (*SnapDeltaHe
 		return nil, fmt.Errorf("unexpected squashfs version %d.%d", sb.MajorVersion, sb.MinorVersion)
 	}
 
+	// Note that currently the only supported delta tool is DeltaToolXdelta3.
 	hdr := &SnapDeltaHeader{
 		Magic:         deltaMagicNumber,
 		FormatVersion: deltaFormatVersion,
 		ToolsVersion:  deltaFormatToolsVersion,
-		DeltaTool:     deltaFormat,
+		DeltaTool:     DeltaToolXdelta3,
 	}
 	// Populate some header fields from the parsed struct
 	hdr.Timestamp = sb.ModificationTime
@@ -265,30 +260,12 @@ func newDeltaHeaderFromSnap(targetSnap string, deltaFormat uint16) (*SnapDeltaHe
 	return hdr, nil
 }
 
-// PseudoEntry represents a parsed line from the definition
-type PseudoEntry struct {
-	FilePath string
-	Type     string
-	// only we only care about size of offset
-	DataSize      int64
-	DataOffset    int64
-	OriginalIndex int // index to the pseudo definition header
-}
-
-// type DeltaToolingCmd func(ctx context.Context, args ...string) *exec.Cmd
-type DeltaToolingCmd func(ctx context.Context, args ...string) *exec.Cmd
-
 // --- Memory Pools ---
-
-// Pool for small bytes.Buffer
-var bufferPool = sync.Pool{
-	New: func() interface{} { return new(bytes.Buffer) },
-}
 
 // Pool for large IO buffers (1MB) to reduce GC pressure during io.Copy
 var ioBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, CopyBufferSize)
+		b := make([]byte, copyBufferSize)
 		return b
 	},
 }
@@ -306,51 +283,46 @@ func copyNBuffer(dst io.Writer, src io.Reader, n int64) (int64, error) {
 	return io.CopyBuffer(dst, io.LimitReader(src, n), bufPtr)
 }
 
-func formatStoreString(id DeltaFormat) string {
-	switch id {
-	case Xdelta3Format:
-		return xdelta3Format
-	case SnapXdelta3Format:
-		return snapDeltaFormatXdelta3
-	case SnapBlockPlanFormat:
-		return snapDeltaFormatBlocks
-	}
-	return "unexpected"
+// Supported delta formats
+type DeltaFormatOpts struct {
+	WithSnapDeltaFormat bool
 }
 
-// Supported delta formats
-func SupportedDeltaFormats() []string {
-	return []string{formatStoreString(SnapBlockPlanFormat),
-		formatStoreString(SnapXdelta3Format), formatStoreString(Xdelta3Format)}
+// Supported delta formats. The order here is determines the preferred formats,
+// with lower indexes being preferred. This might become eventually
+// compatibility labels if necessary.
+func SupportedDeltaFormats(opts DeltaFormatOpts) []string {
+	var formats []string
+	if opts.WithSnapDeltaFormat {
+		formats = append(formats, snapDeltaFormatBlocks, snapDeltaFormatXdelta3)
+	}
+	formats = append(formats, xdelta3Format)
+	return formats
 }
 
 // GenerateDelta creates a delta file called delta from sourceSnap and
 // targetSnap, using deltaFormat.
-func GenerateDelta(sourceSnap, targetSnap, delta string, deltaFormat DeltaFormat) error {
-	// Context with cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+func GenerateDelta(ctx context.Context, sourceSnap, targetSnap, delta string, deltaFormat string) error {
 	switch deltaFormat {
-	case Xdelta3Format:
+	case xdelta3Format:
 		// Plain xdelta3 on compressed files
 		return generatePlainXdelta3Delta(ctx, sourceSnap, targetSnap, delta)
-	case SnapXdelta3Format:
-		return generateSnapDelta(ctx, cancel, sourceSnap, targetSnap, delta, DeltaToolXdelta3)
-	case SnapBlockPlanFormat:
+	case snapDeltaFormatXdelta3:
+		return generateSnapDelta(ctx, sourceSnap, targetSnap, delta)
+	case snapDeltaFormatBlocks:
 		_, err := generateBlockPlan(ctx, sourceSnap, targetSnap, delta,
 			blockPlanGenOpts{Verify: true})
 		return err
 	default:
-		return fmt.Errorf("unsupported delta format %d", deltaFormat)
+		return fmt.Errorf("unsupported delta format %q", deltaFormat)
 	}
 }
 
-func generateSnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap, targetSnap, delta string, deltaFormat uint16) error {
+func generateSnapDelta(ctx context.Context, sourceSnap, targetSnap, delta string) error {
 	fmt.Println("Generating delta...")
 
 	// Build delta header, using the target header
-	hdr, err := newDeltaHeaderFromSnap(targetSnap, deltaFormat)
+	hdr, err := newDeltaHeaderFromSnap(targetSnap)
 	if err != nil {
 		return err
 	}
@@ -370,14 +342,7 @@ func generateSnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSna
 		return fmt.Errorf("cannot write delta header: %w", err)
 	}
 
-	// run delta producer for given deta tool
-	switch deltaFormat {
-	case DeltaToolXdelta3:
-		err = generateXdelta3Delta(ctx, deltaFile, sourceSnap, targetSnap)
-	default:
-		err = fmt.Errorf("unsupported delta tool 0x%X", hdr.DeltaTool)
-	}
-	if err != nil {
+	if err := generateXdelta3Delta(ctx, deltaFile, sourceSnap, targetSnap); err != nil {
 		deltaFile.Close()
 		if err := os.Remove(delta); err != nil {
 			fmt.Printf("cannot clean-up delta file: %s\n", err)
@@ -391,11 +356,7 @@ func generateSnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSna
 // how many blocks the compressor may work on at once, and reaches only the
 // block-plan format: the pseudo-file formats hand a whole stream to one
 // mksquashfs, which decides its own parallelism.
-func ApplyDelta(sourceSnap, delta, targetSnap string, jobs int) error {
-	// Global Context with cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+func ApplyDelta(ctx context.Context, sourceSnap, delta, targetSnap string, jobs int) error {
 	deltaFile, err := os.Open(delta)
 	if err != nil {
 		return fmt.Errorf("cannot open delta: %w", err)
@@ -425,7 +386,7 @@ func ApplyDelta(sourceSnap, delta, targetSnap string, jobs int) error {
 		if err := binary.Read(bytes.NewReader(buf), binary.LittleEndian, hdr); err != nil {
 			return fmt.Errorf("cannot decode header: %w", err)
 		}
-		return applySnapDelta(ctx, cancel, sourceSnap, targetSnap, deltaFile, hdr)
+		return applySnapDelta(ctx, sourceSnap, targetSnap, deltaFile, hdr)
 	case blockPlanMagic:
 		// The block plan reads its own header, so hand the whole file back
 		// from the start.
@@ -438,7 +399,7 @@ func ApplyDelta(sourceSnap, delta, targetSnap string, jobs int) error {
 	}
 }
 
-func applySnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap, targetSnap string, deltaFile *os.File, hdr *SnapDeltaHeader) error {
+func applySnapDelta(ctx context.Context, sourceSnap, targetSnap string, deltaFile *os.File, hdr *SnapDeltaHeader) error {
 	if hdr.Magic != deltaMagicNumber {
 		return fmt.Errorf("invalid magic 0x%X", hdr.Magic)
 	}
@@ -465,10 +426,44 @@ func applySnapDelta(ctx context.Context, cancel context.CancelFunc, sourceSnap, 
 	// run delta apply for given deta tool
 	switch hdr.DeltaTool {
 	case DeltaToolXdelta3:
-		return applyXdelta3Delta(ctx, sourceSnap, targetSnap, deltaFile, mksqfsArgs)
+		if err := applyXdelta3Delta(ctx, sourceSnap, targetSnap, deltaFile, mksqfsArgs); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unsupported delta tool 0x%X", hdr.DeltaTool)
 	}
+
+	// mksquashfs does not know about snap minimum size requirements, so
+	// we need to pad the reconstructed snap to MinimumSnapSize, same as
+	// snap pack does in Build(). Without this, small snaps would be
+	// shorter than the original target because snap pack pads them.
+	//
+	// snap-2-1-blocks needs none of this: it reproduces the target's bytes
+	// exactly, padding included, rather than rebuilding it with mksquashfs.
+	return growSnapToMinSize(targetSnap, MinimumSnapSize)
+}
+
+// MinimumSnapSize is the smallest size a snap can be. The kernel attempts to read a
+// partition table from the snap when a loopback device is created from it. If the snap
+// is smaller than this size, some versions of the kernel will print error logs while
+// scanning the loopback device for partitions.
+//
+// In snapd this lives in squashfs.go, next to Build, which pads the same way.
+const MinimumSnapSize int64 = 16384
+
+// growSnapToMinSize pads a file to minSize with zero bytes if it is smaller.
+func growSnapToMinSize(path string, minSize int64) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("cannot get size of snap: %w", err)
+	}
+	if fi.Size() >= minSize {
+		return nil
+	}
+	if err := os.Truncate(path, minSize); err != nil {
+		return fmt.Errorf("cannot grow snap to minimum size: %w", err)
+	}
+	return nil
 }
 
 // generatePlainXdelta3Delta generates a delta between compressed snaps
@@ -687,165 +682,6 @@ func applyHdiffzPatch(ctx context.Context, oldPath, diffPath, outPath, hpatchzPa
 	return nil
 }
 
-// unescape: only allocates if backslash is present
-func unescape(s string) string {
-	if strings.IndexByte(s, '\\') == -1 {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+1 < len(s) && (s[i+1] == ' ' || s[i+1] == '\\') {
-			i++
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
-}
-
-// parsePseudoDefinitionLine splits a line into [Filename, Type, ...Args].
-// It handles filenames with escaped spaces (e.g., "My\ File R ...").
-func parsePseudoDefinitionLine(line string) ([]string, error) {
-	// 1. Find the delimiter: the first space NOT preceded by a backslash
-	splitIdx := -1
-	for i := 0; i < len(line); i++ {
-		if line[i] == ' ' {
-			if i == 0 || line[i-1] != '\\' {
-				splitIdx = i
-				break
-			}
-		}
-	}
-
-	// Handle case with no valid delimiter (e.g., just a filename)
-	if splitIdx == -1 {
-		// Valid pseudo-definitions usually require at least Name + Type + Metadata.
-		// We return an error to signal the caller to skip this line.
-		return nil, fmt.Errorf("insufficient fields (no delimiter found)")
-	}
-
-	// 2. Extract and unescape the filename
-	name := unescape(line[:splitIdx])
-
-	// 3. Extract the metadata fields (standard space-separated)
-	rest := strings.Fields(line[splitIdx+1:])
-
-	// 4. Construct result: [Name, Type, ...Rest]
-	// Pre-allocate slice for efficiency
-	result := make([]string, 0, 1+len(rest))
-	result = append(result, name)
-	result = append(result, rest...)
-
-	// Basic validation: Original code expected at least 3 parts (Name, Type, +1 info)
-	if len(result) < 3 {
-		return nil, fmt.Errorf("insufficient fields (got %d, expected >=3)", len(result))
-	}
-
-	return result, nil
-}
-
-// parsePseudoStream encapsulates the logic to read the mixed text/binary stream.
-// It stops reading exactly at the end of the text header definition to allow
-// subsequent binary reads from the same reader.
-func parsePseudoStream(reader *bufio.Reader) ([]PseudoEntry, *bytes.Buffer, error) {
-	var entries []PseudoEntry
-
-	headerBuffer := bufferPool.Get().(*bytes.Buffer)
-	headerBuffer.Reset()
-
-	headerEnd := false
-
-	for {
-		// ReadBytes is used instead of Scanner to prevent over-buffering.
-		// We must not read past the newline of the last header line.
-		lineBytes, err := reader.ReadBytes('\n')
-		if err != nil && err != io.EOF {
-			return nil, nil, fmt.Errorf("stream read error: %w", err)
-		}
-
-		// Store raw line in header buffer (includes the newline)
-		headerBuffer.Write(lineBytes)
-
-		// Stop if we hit EOF and have no data left
-		if len(lineBytes) == 0 && err == io.EOF {
-			break
-		}
-
-		lineStr := string(lineBytes)
-		trimmed := strings.TrimSpace(lineStr)
-
-		// Skip empty lines or comments
-		if len(trimmed) == 0 {
-			if err == io.EOF {
-				break
-			}
-			continue
-		}
-
-		// Handle Comments and Control Markers
-		if trimmed[0] == '#' {
-			// Terminate logic: matches original behavior.
-			// If we already saw the "# START OF DATA" marker, and this is *another* comment,
-			// we assume the header is finished.
-			if headerEnd {
-				break
-			}
-
-			// Check for the specific start-of-data marker
-			if trimmed == "# START OF DATA - DO NOT MODIFY" {
-				headerEnd = true
-				continue
-			}
-
-			// Regular comment, ignore
-			if err == io.EOF {
-				break
-			}
-			continue
-		}
-
-		// Parse the definition line
-		fields, parseErr := parsePseudoDefinitionLine(trimmed)
-		if parseErr != nil {
-			// In the original logic, malformed lines (len < 3) were ignored silently.
-			// We continue here to preserve that tolerance, unless it's EOF.
-			if err == io.EOF {
-				break
-			}
-			continue
-		}
-
-		// We only process "R" (Regular File) entries for Delta generation
-		// Format: FilePath | Type | Time | Mode | UID | GID | Size | Offset
-		if fields[1] == "R" {
-			if len(fields) < 8 {
-				return nil, nil, fmt.Errorf("malformed 'R' entry (expected >=8 fields, got %d): %s", len(fields), trimmed)
-			}
-
-			entry := PseudoEntry{
-				FilePath: fields[0],
-				Type:     fields[1],
-			}
-
-			var convErr error
-			if entry.DataSize, convErr = strconv.ParseInt(fields[6], 10, 64); convErr != nil {
-				return nil, nil, fmt.Errorf("invalid size in entry %s: %w", entry.FilePath, convErr)
-			}
-			if entry.DataOffset, convErr = strconv.ParseInt(fields[7], 10, 64); convErr != nil {
-				return nil, nil, fmt.Errorf("invalid offset in entry %s: %w", entry.FilePath, convErr)
-			}
-
-			entries = append(entries, entry)
-		}
-
-		if err == io.EOF {
-			break
-		}
-	}
-
-	return entries, headerBuffer, nil
-}
-
 // --- Infrastructure ---
 
 // setupPipes creates a temporary directory and named pipes within it.
@@ -939,15 +775,6 @@ func cmdFromSystemSnapImpl(toolPath string, cmdArgs ...string) (*exec.Cmd, error
 	// TODO: check minimal required version
 	// the 'tool' in the env worked, so use that one
 	return exec.Command(loc, cmdArgs...), nil
-}
-
-// --- Utils ---
-
-func wrapErr(err error, msg string) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("%s failed: %w", msg, err)
 }
 
 // ReusableMemFD wraps a file descriptor that can be reset and reused.
@@ -1680,8 +1507,8 @@ func main() {
 			})
 			break
 		}
-		fmt.Printf("requested delta tool: 0x%X\n", SnapXdelta3Format)
-		err = GenerateDelta(c.genSource, c.genTarget, c.genDelta, SnapXdelta3Format)
+		fmt.Printf("requested delta format: %s\n", snapDeltaFormatXdelta3)
+		err = GenerateDelta(context.Background(), c.genSource, c.genTarget, c.genDelta, snapDeltaFormatXdelta3)
 
 	case "apply":
 		if c.appSource == "" || c.appTarget == "" || c.appDelta == "" {
@@ -1700,7 +1527,7 @@ func main() {
 			}
 			break
 		}
-		err = ApplyDelta(c.appSource, c.appDelta, c.appTarget, c.appJobs)
+		err = ApplyDelta(context.Background(), c.appSource, c.appDelta, c.appTarget, c.appJobs)
 
 	case "selftest":
 		if cmd.fs.NArg() == 0 {
