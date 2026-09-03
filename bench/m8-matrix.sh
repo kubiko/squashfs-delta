@@ -50,7 +50,7 @@ for entry in "${PAIRS[@]}"; do
 	gen_t0=$(date +%s.%N)
 	# Piping into sed would report sed's status, not the generator's, so keep
 	# the exit code and indent afterwards.
-	"$BIN" generate --blocks -s "$src" -t "$tgt" -d "$delta" > "$WORK/gen.out" 2>&1
+	"$BIN" generate --hdiffz -s "$src" -t "$tgt" -d "$delta" > "$WORK/gen.out" 2>&1
 	genrc=$?
 	sed 's/^/    /' "$WORK/gen.out"
 	if [ $genrc -ne 0 ]; then

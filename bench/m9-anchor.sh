@@ -41,7 +41,7 @@ for p in "${pairs[@]}"; do
 		flag=""
 		[ "$mode" = offset ] && flag="-no-path-match"
 		echo "-- anchored by $mode"
-		"$BIN" generate --blocks $flag -s "$s" -t "$t" -d "$OUT/d.$mode" 2>&1 |
+		"$BIN" generate --hdiffz $flag -s "$s" -t "$t" -d "$OUT/d.$mode" 2>&1 |
 			sed 's/^/   /'
 	done
 	so=$(stat -c%s "$OUT/d.offset" 2>/dev/null || echo 0)

@@ -25,7 +25,7 @@ import (
 	"os"
 )
 
-// This file defines the snap-2-1-blocks delta container.
+// This file defines the snap-2-1-hdiffz delta container.
 //
 // The format describes the target image byte for byte, so applying it never
 // re-derives any mksquashfs decision -- no duplicate detection, no block
@@ -50,8 +50,10 @@ const (
 	blockPlanHeaderSize    = 128
 	blockPlanEntrySize     = 16
 
-	// snapDeltaFormatBlocks is the store name of this format.
-	snapDeltaFormatBlocks = "snap-2-1-blocks"
+	// snapDeltaFormatHdiffz is the store name of this format. The version
+	// pair says what it is: the second generation of the snap delta format,
+	// patched with the same hdiffz/hpatchz pair the 1-1 generation used.
+	snapDeltaFormatHdiffz = "snap-2-1-hdiffz"
 )
 
 // Section ids. Order in the table is the order on disk, and the applier relies

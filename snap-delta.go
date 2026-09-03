@@ -44,7 +44,7 @@ import (
 // - plain xdelta3 diff file on the compressed snaps
 // - xdelta3 diff on an uncompressed representation of the snap files defined
 //   by squashfs-tools called pseudo-files
-// - snap-2-1-blocks, which describes the target as instructions over the
+// - snap-2-1-hdiffz, which describes the target as instructions over the
 //   source's already-compressed blocks; see blockplan.go
 //
 // The format supporting pseudo-files has files with a header preceding the
@@ -104,7 +104,7 @@ const (
 	deltaFormatToolsVersion = uint8(0x01)
 
 	// Tool IDs. DeltaToolHdiffz names no snap-1-1 format any more -- that one
-	// was removed -- but it stays as the id snap-2-1-blocks records for the
+	// was removed -- but it stays as the id snap-2-1-hdiffz records for the
 	// tool its patch runs were diffed with.
 	DeltaToolXdelta3 = uint16(0x1)
 	DeltaToolHdiffz  = uint16(0x2)
@@ -294,7 +294,7 @@ type DeltaFormatOpts struct {
 func SupportedDeltaFormats(opts DeltaFormatOpts) []string {
 	var formats []string
 	if opts.WithSnapDeltaFormat {
-		formats = append(formats, snapDeltaFormatBlocks, snapDeltaFormatXdelta3)
+		formats = append(formats, snapDeltaFormatHdiffz, snapDeltaFormatXdelta3)
 	}
 	formats = append(formats, xdelta3Format)
 	return formats
@@ -309,7 +309,7 @@ func GenerateDelta(ctx context.Context, sourceSnap, targetSnap, delta string, de
 		return generatePlainXdelta3Delta(ctx, sourceSnap, targetSnap, delta)
 	case snapDeltaFormatXdelta3:
 		return generateSnapDelta(ctx, sourceSnap, targetSnap, delta)
-	case snapDeltaFormatBlocks:
+	case snapDeltaFormatHdiffz:
 		_, err := generateBlockPlan(ctx, sourceSnap, targetSnap, delta,
 			blockPlanGenOpts{Verify: true})
 		return err
@@ -438,7 +438,7 @@ func applySnapDelta(ctx context.Context, sourceSnap, targetSnap string, deltaFil
 	// snap pack does in Build(). Without this, small snaps would be
 	// shorter than the original target because snap pack pads them.
 	//
-	// snap-2-1-blocks needs none of this: it reproduces the target's bytes
+	// snap-2-1-hdiffz needs none of this: it reproduces the target's bytes
 	// exactly, padding included, rather than rebuilding it with mksquashfs.
 	return growSnapToMinSize(targetSnap, MinimumSnapSize)
 }
@@ -1085,7 +1085,7 @@ func (g *Group) Go(f func() error) {
 //
 // The table also carries which options belong to which delta format, which the
 // help shows and the parser enforces: --no-verify and the rest of the tuning
-// mean nothing without --blocks, and silently ignoring them would let a sweep
+// mean nothing without --hdiffz, and silently ignoring them would let a sweep
 // measure a setting it never actually applied.
 
 // option is one command-line option: how it is spelled, what it takes, and what
@@ -1122,14 +1122,14 @@ func (o option) register(fs *flag.FlagSet) {
 	}
 }
 
-// optionGroup is a heading in the help and, when blocksOnly is set, a rule the
+// optionGroup is a heading in the help and, when blockPlanOnly is set, a rule the
 // parser enforces.
 type optionGroup struct {
 	title   string
 	options []option
-	// blocksOnly marks options that only the block-plan format reads. Passing
-	// one without --blocks is refused rather than ignored.
-	blocksOnly bool
+	// blockPlanOnly marks options that only the block-plan format reads.
+	// Passing one without --hdiffz is refused rather than ignored.
+	blockPlanOnly bool
 }
 
 // command is one operation: how the help introduces it, how it is invoked, and
@@ -1186,7 +1186,7 @@ func (c *command) misplacedOption(blocks bool) string {
 	}
 	set := c.setFlags()
 	for _, g := range c.groups {
-		if !g.blocksOnly {
+		if !g.blockPlanOnly {
 			continue
 		}
 		for _, o := range g.options {
@@ -1204,7 +1204,7 @@ type cli struct {
 	commands []*command
 
 	genSource, genTarget, genDelta                  string
-	xdelta3Tool, blocksFormat                       bool
+	xdelta3Tool, hdiffzFormat                       bool
 	genMaxRun, genMinSaving                         int
 	genNoVerify, genNoPatchRuns, genNoPathMatch     bool
 	genRunLog                                       bool
@@ -1254,10 +1254,11 @@ func newCLI() *cli {
 		}, {
 			title: "DELTA FORMAT (pick exactly one)",
 			options: []option{
-				{long: "blocks", help: []string{
-					snapDeltaFormatBlocks + " format: allows reassembly without",
+				{long: "hdiffz", help: []string{
+					snapDeltaFormatHdiffz + " format: allows reassembly without",
 					"recompressing unchanged blocks (enables tuning below)",
-				}, bind: yes(&c.blocksFormat)},
+					"Delta uses hdiffz/hpathz patch tool.",
+				}, bind: yes(&c.hdiffzFormat)},
 				{long: "xdelta3", help: []string{
 					snapDeltaFormatXdelta3 + " format: xdelta3 over pseudo-file",
 				}, bind: yes(&c.xdelta3Tool)},
@@ -1267,8 +1268,8 @@ func newCLI() *cli {
 			// its defaults were measured; nothing but a sweep should pass them.
 			// The run log is how a sweep's result gets read: an aggregate
 			// report says what a delta cost, not which runs cost it.
-			title:      "BLOCKS MODE TUNING (valid only with --blocks)",
-			blocksOnly: true,
+			title:         "HDIFFZ MODE TUNING (valid only with --hdiffz)",
+			blockPlanOnly: true,
 			options: []option{
 				{long: "max-run", arg: "<int>", help: []string{
 					"Cap plaintext reconstructed in one patch run (default: 0)",
@@ -1313,7 +1314,7 @@ func newCLI() *cli {
 				{short: "t", long: "target", arg: "<file>", help: []string{"Reconstructed snap output file"}, bind: str(&c.appTarget, "")},
 			},
 		}, {
-			title: "BLOCKS DELTA OPTIONS (ignored for other formats)",
+			title: "HDIFFZ DELTA OPTIONS (ignored for other formats)",
 			options: []option{
 				{short: "j", long: "jobs", arg: "<int>", help: jobsHelp, bind: num(&c.appJobs, 0)},
 				{long: "max-run", arg: "<int>", help: []string{
@@ -1427,7 +1428,7 @@ func (c *cli) printUsage(w io.Writer, msg string) {
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "EXAMPLES:")
-	fmt.Fprintf(w, "  %s generate --blocks -s core22_2134.snap -t core22_2140.snap -d core22.delta\n", appName())
+	fmt.Fprintf(w, "  %s generate --hdiffz -s core22_2134.snap -t core22_2140.snap -d core22.delta\n", appName())
 	fmt.Fprintf(w, "  %s apply --stats -s core22_2134.snap -d core22.delta -t rebuilt.snap\n", appName())
 	fmt.Fprintf(w, "  %s selftest core22_2140.snap\n", appName())
 }
@@ -1484,15 +1485,15 @@ func main() {
 		// Exactly one format, so that a delta is never generated in a format
 		// the caller did not ask for -- and, with the check above it, so that
 		// tuning meant for one is never quietly dropped on another.
-		if n := btoi(c.blocksFormat) + btoi(c.xdelta3Tool); n != 1 {
+		if n := btoi(c.hdiffzFormat) + btoi(c.xdelta3Tool); n != 1 {
 			cmd.fs.Usage()
-			log.Fatalf("Pick exactly one delta format for 'generate': --blocks or --xdelta3 (given %d)", n)
+			log.Fatalf("Pick exactly one delta format for 'generate': --hdiffz or --xdelta3 (given %d)", n)
 		}
-		if bad := cmd.misplacedOption(c.blocksFormat); bad != "" {
+		if bad := cmd.misplacedOption(c.hdiffzFormat); bad != "" {
 			cmd.fs.Usage()
-			log.Fatalf("%s tunes the %s format and is only read with --blocks", bad, snapDeltaFormatBlocks)
+			log.Fatalf("%s tunes the %s format and is only read with --hdiffz", bad, snapDeltaFormatHdiffz)
 		}
-		if c.blocksFormat {
+		if c.hdiffzFormat {
 			err = cmdGenerateBlocks(context.Background(), c.genSource, c.genTarget, c.genDelta, genCmdOpts{
 				MaxRun:        c.genMaxRun,
 				Verify:        !c.genNoVerify,

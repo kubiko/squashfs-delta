@@ -31,7 +31,7 @@ for p in "${pairs[@]}"; do
 	echo "==== $(basename "$s") -> $(basename "$t")"
 	printf "%8s %12s %14s %10s %10s\n" rate delta compresses avoided decompresses
 	for rate in 0.02 0.05 0.10 0.20 0.40; do
-		out=$("$BIN" generate --blocks -no-verify -min-saving-rate "$rate" \
+		out=$("$BIN" generate --hdiffz -no-verify -min-saving-rate "$rate" \
 			-s "$s" -t "$t" -d "$OUT/d" 2>&1)
 		size=$(stat -c%s "$OUT/d" 2>/dev/null || echo 0)
 		line=$(echo "$out" | grep "apply compresses")

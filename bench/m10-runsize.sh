@@ -46,7 +46,7 @@ for p in "${pairs[@]}"; do
 	echo "   snap-1-1-Hdiffz delta $ref bytes"
 	printf "%10s %12s %8s %7s %12s %12s\n" cap delta "vs ref" runs patch scratch
 	for cap in 8 16 32 64 128; do
-		out=$("$BIN" generate --blocks -no-verify -min-saving 0 \
+		out=$("$BIN" generate --hdiffz -no-verify -min-saving 0 \
 			-max-run $((cap << 20)) -s "$s" -t "$t" -d "$OUT/d" 2>&1)
 		size=$(stat -c%s "$OUT/d" 2>/dev/null || echo 0)
 		runs=$(echo "$out" | sed -n 's/.*, \([0-9]*\) patch run).*/\1/p' | head -1)

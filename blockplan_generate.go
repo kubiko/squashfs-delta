@@ -157,7 +157,7 @@ type blockPlanGenOpts struct {
 // eight on an lzo image. A device with a ceiling sets both.
 const defaultMaxRunUSize = 8 << 20
 
-// generateBlockPlan writes a snap-2-1-blocks delta from sourcePath to
+// generateBlockPlan writes a snap-2-1-hdiffz delta from sourcePath to
 // targetPath at deltaPath.
 func generateBlockPlan(ctx context.Context, sourcePath, targetPath, deltaPath string, opts blockPlanGenOpts) (*genStats, error) {
 	t0 := time.Now()

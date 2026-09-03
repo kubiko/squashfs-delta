@@ -3,7 +3,7 @@
 #
 # snap-1-1-Hdiffz turns both images into a pseudo-file definition, which means an
 # apply decompresses the whole source and recompresses the whole target -- the CPU
-# cost that started this work. snap-2-1-blocks copies unchanged blocks verbatim and
+# cost that started this work. snap-2-1-hdiffz copies unchanged blocks verbatim and
 # only ever hands the compressor a patch run's plaintext.
 #
 # What is measured, per pair and per format: delta size, and for the apply, wall
@@ -19,7 +19,7 @@
 #
 # What they said, once the window picker stopped ending a window at the first raw
 # stretch and the saving floor came off (delta bytes, then apply CPU as user+sys,
-# then peak RSS over the process tree; snap-1-1-Hdiffz first, snap-2-1-blocks
+# then peak RSS over the process tree; snap-1-1-Hdiffz first, snap-2-1-hdiffz
 # second):
 #
 #   post75 -> post77       735,386 / 48.1s / 213.5M   544,423 / 11.5s / 14.4M
@@ -80,6 +80,19 @@ timed() {
 		"$(awk -v r="$rss" 'BEGIN{print r/1024}')"
 }
 
+# The baseline is gone from the tool: snap-1-1-Hdiffz was removed once
+# snap-2-1-hdiffz replaced it, and --hdiffz now names the replacement. Running
+# the baseline needs a binary built before that removal, which BASELINE_BIN
+# points at; without one the script measures only what this build can still do,
+# rather than comparing the new format against itself and calling it a win.
+variants=(snap-2-1-hdiffz snap-2-1-hdiffz-cpu)
+if [ -n "${BASELINE_BIN:-}" ]; then
+	variants=(snap-1-1-Hdiffz "${variants[@]}")
+else
+	echo "note: BASELINE_BIN unset, so the snap-1-1-Hdiffz column is not measured;"
+	echo "      the figures it produced are in the header of this script."
+fi
+
 for p in "${pairs[@]}"; do
 	set -- $p
 	s=$1
@@ -87,20 +100,22 @@ for p in "${pairs[@]}"; do
 	echo "==== $(basename "$s") -> $(basename "$t")"
 	echo "   target $(stat -c%s "$t") bytes"
 
-	for variant in hdiffz blocks blocks-cpu; do
+	for variant in "${variants[@]}"; do
+		bin=$BIN
 		case $variant in
-		hdiffz) gen_args=(--hdiffz) ;;
-		blocks) gen_args=(--blocks -no-verify) ;;
-		blocks-cpu) gen_args=(--blocks -no-verify -min-saving-rate 0.20) ;;
+		# The baseline's own binary, where --hdiffz still meant the 1-1 format.
+		snap-1-1-Hdiffz) bin=$BASELINE_BIN; gen_args=(--hdiffz) ;;
+		snap-2-1-hdiffz) gen_args=(--hdiffz -no-verify) ;;
+		snap-2-1-hdiffz-cpu) gen_args=(--hdiffz -no-verify -min-saving-rate 0.20) ;;
 		esac
 		d="$OUT/d.$variant"
-		if ! timed "generate $variant" "$BIN" generate "${gen_args[@]}" -s "$s" -t "$t" -d "$d"; then
+		if ! timed "generate $variant" "$bin" generate "${gen_args[@]}" -s "$s" -t "$t" -d "$d"; then
 			continue
 		fi
 		size=$(stat -c%s "$d")
 		printf "   %-22s %d bytes (%.2f%% of target)\n" "delta $variant" "$size" \
 			"$(awk -v a="$size" -v b="$(stat -c%s "$t")" 'BEGIN{print 100*a/b}')"
-		if ! timed "apply $variant" "$BIN" apply -s "$s" -d "$d" -t "$OUT/rebuilt"; then
+		if ! timed "apply $variant" "$bin" apply -s "$s" -d "$d" -t "$OUT/rebuilt"; then
 			continue
 		fi
 		if cmp -s "$OUT/rebuilt" "$t"; then

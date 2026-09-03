@@ -49,7 +49,7 @@ for p in "${pairs[@]}"; do
 	echo "   snap-1-1-Hdiffz delta $ref bytes"
 	printf "%10s %12s %8s %12s %14s %10s\n" back delta "vs ref" patch compresses avoided
 	for back in 0 0.1 0.25 0.4 0.5; do
-		out=$("$BIN" generate --blocks -no-verify -min-saving 0 -window-back "$back" \
+		out=$("$BIN" generate --hdiffz -no-verify -min-saving 0 -window-back "$back" \
 			-s "$s" -t "$t" -d "$OUT/d" 2>&1)
 		size=$(stat -c%s "$OUT/d" 2>/dev/null || echo 0)
 		patch=$(echo "$out" | sed -n 's/^  patch runs *\(.*\) of patch.*/\1/p')

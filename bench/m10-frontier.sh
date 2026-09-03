@@ -41,7 +41,7 @@ for p in "${pairs[@]}"; do
 	[ "$ref" != 0 ] && echo "   snap-1-1-Hdiffz delta $ref bytes"
 	printf "%10s %12s %8s %14s %10s %10s\n" floor delta "vs ref" compresses avoided literals
 	for floor in 0 2048 4096 8192 16384 65536; do
-		out=$("$BIN" generate --blocks -no-verify -min-saving "$floor" \
+		out=$("$BIN" generate --hdiffz -no-verify -min-saving "$floor" \
 			-s "$s" -t "$t" -d "$OUT/d" 2>&1)
 		size=$(stat -c%s "$OUT/d" 2>/dev/null || echo 0)
 		line=$(echo "$out" | grep "apply compresses")

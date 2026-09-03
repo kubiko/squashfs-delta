@@ -43,7 +43,7 @@ for p in "${pairs[@]}"; do
 	printf "%8s %12s %6s %6s %8s %9s %8s %10s\n" \
 		floor delta runs lits compress wall cpu "peak RSS"
 	for floor in 0 2048 4096 16384; do
-		gen=$("$BIN" generate --blocks -no-verify -min-saving "$floor" \
+		gen=$("$BIN" generate --hdiffz -no-verify -min-saving "$floor" \
 			-s "$s" -t "$t" -d "$OUT/d" 2>&1)
 		size=$(stat -c%s "$OUT/d" 2>/dev/null || echo 0)
 		# The instructions line reads "N (a copy, b literal, c patch run)".
