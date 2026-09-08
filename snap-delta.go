@@ -1255,12 +1255,12 @@ func newCLI() *cli {
 			title: "DELTA FORMAT (pick exactly one)",
 			options: []option{
 				{long: "hdiffz", help: []string{
-					snapDeltaFormatHdiffz + " format: allows reassembly without",
+					"'" + snapDeltaFormatHdiffz + "' format: allows reassembly without",
 					"recompressing unchanged blocks (enables tuning below)",
 					"Delta uses hdiffz/hpathz patch tool.",
 				}, bind: yes(&c.hdiffzFormat)},
 				{long: "xdelta3", help: []string{
-					snapDeltaFormatXdelta3 + " format: xdelta3 over pseudo-file",
+					"'" + snapDeltaFormatXdelta3 + "' format: xdelta3 over pseudo-file",
 				}, bind: yes(&c.xdelta3Tool)},
 			},
 		}, {
