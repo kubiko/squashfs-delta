@@ -43,6 +43,8 @@ typedef int (*sqd_lzo_dec_fn)(const unsigned char *src, lzo_uint src_len,
 static sqd_lzo_999_fn sqd_lzo_999;
 static sqd_lzo_opt_fn sqd_lzo_opt;
 static sqd_lzo_dec_fn sqd_lzo_dec;
+typedef const char *(*sqd_lzo_version_fn)(void);
+static sqd_lzo_version_fn sqd_lzo_version;
 
 // sqd_lzo_load resolves the entry points from one library path, returning a
 // dlerror string on failure and NULL on success.
@@ -54,11 +56,23 @@ static const char *sqd_lzo_load(const char *path) {
 	sqd_lzo_999 = (sqd_lzo_999_fn)dlsym(h, "lzo1x_999_compress_level");
 	sqd_lzo_opt = (sqd_lzo_opt_fn)dlsym(h, "lzo1x_optimize");
 	sqd_lzo_dec = (sqd_lzo_dec_fn)dlsym(h, "lzo1x_decompress_safe");
+	// The version string is diagnostic only: a library that predates it must
+	// still load, so it is not part of the entry point check below.
+	sqd_lzo_version = (sqd_lzo_version_fn)dlsym(h, "lzo_version_string");
 	if (sqd_lzo_999 == NULL || sqd_lzo_opt == NULL || sqd_lzo_dec == NULL) {
 		dlclose(h);
 		return "library does not export the lzo1x entry points";
 	}
 	return NULL;
+}
+
+// sqd_lzo_version_str is the library's own version string, or NULL when it
+// does not export one.
+static const char *sqd_lzo_version_str(void) {
+	if (sqd_lzo_version == NULL) {
+		return NULL;
+	}
+	return sqd_lzo_version();
 }
 
 // Status codes, distinguishing which stage failed. The library's own error code
@@ -270,6 +284,23 @@ func (l *lzoCompressor) worker(j int) *lzoWorker {
 }
 
 func (l *lzoCompressor) ID() uint16 { return compressorLzo }
+
+// ToolVersion is the version of the very library the blocks were compressed
+// with, or "" when the library does not export one.
+func (l *lzoCompressor) ToolVersion() string {
+	if v := lzoVersion(); v != "" {
+		return "lzo: " + v
+	}
+	return ""
+}
+
+// lzoVersion is the loaded library's own version string.
+func lzoVersion() string {
+	if v := C.sqd_lzo_version_str(); v != nil {
+		return C.GoString(v)
+	}
+	return ""
+}
 
 func (l *lzoCompressor) MaxBlocksPerCall() int { return lzoMaxBlocksPerCall }
 

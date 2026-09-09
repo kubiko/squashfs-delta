@@ -371,6 +371,24 @@ func (x *xzCLI) NeedsBlockSizes() bool { return false }
 
 func (x *xzCLI) SectionCodec() uint16 { return codecXZ }
 
+// ToolVersion reports the xz this machine will recompress with. The probe is
+// best-effort on purpose: a version line is diagnostic, not a gate.
+func (x *xzCLI) ToolVersion() string {
+	bin, err := x.binary()
+	if err != nil {
+		return ""
+	}
+	out, err := exec.Command(bin, "--version").Output()
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+	if line == "" {
+		return ""
+	}
+	return "xz: " + line
+}
+
 // threadArg is the -T for a call compressing nBlocks blocks.
 //
 // Thread count changes only how fast the output arrives, never the output

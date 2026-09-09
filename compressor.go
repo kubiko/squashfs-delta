@@ -59,6 +59,12 @@ type Compressor interface {
 	// is what ties it back to the superblock it was derived from.
 	ID() uint16
 
+	// ToolVersion reports, as "name: version", the tool or library on this
+	// machine this implementation compresses with. An empty string means it
+	// could not be determined, which SEC_TOOLVER records as no line rather
+	// than a failure.
+	ToolVersion() string
+
 	// CompressBlocks compresses each block of plain, delimited by uSizes,
 	// independently with the given dictionary size, calling fn once per
 	// block in ascending order. Blocks are independent, so callers may

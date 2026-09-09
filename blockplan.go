@@ -66,6 +66,13 @@ const (
 	secMDPatch uint16 = 5 // patch: source metadata blob -> target metadata blob
 	secInstr   uint16 = 6 // instruction stream
 	secPay     uint16 = 7 // patch blobs and literal bytes, in instruction order
+	// secToolVer records the tool versions the delta was built with. It is
+	// advisory: an applier that predates it reads and ignores the section
+	// like any unknown one, and a delta that predates it carries none.
+	// It is not the header's ToolsVersion, which numbers the format's own
+	// generation and is hard-rejected on mismatch -- this section names
+	// binaries and libraries, and never fails an apply.
+	secToolVer uint16 = 8 // "name: version" lines for the build tools
 )
 
 // Section codecs. Each compressor names the one it writes -- see
@@ -94,6 +101,8 @@ func sectionName(id uint16) string {
 		return "SEC_INSTR"
 	case secPay:
 		return "SEC_PAY"
+	case secToolVer:
+		return "SEC_TOOLVER"
 	}
 	return fmt.Sprintf("SEC_%d", id)
 }

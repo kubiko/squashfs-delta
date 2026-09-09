@@ -48,6 +48,8 @@ static sqd_zstd_decompress_fn sqd_zstd_decompress_dctx;
 static sqd_zstd_iserr_fn sqd_zstd_is_error;
 static sqd_zstd_errname_fn sqd_zstd_error_name;
 static sqd_zstd_bound_fn sqd_zstd_compress_bound;
+typedef const char *(*sqd_zstd_version_fn)(void);
+static sqd_zstd_version_fn sqd_zstd_version;
 
 // sqd_zstd_load resolves the entry points from one library path, returning a
 // dlerror string on failure and NULL on success.
@@ -65,6 +67,9 @@ static const char *sqd_zstd_load(const char *path) {
 	sqd_zstd_is_error = (sqd_zstd_iserr_fn)dlsym(h, "ZSTD_isError");
 	sqd_zstd_error_name = (sqd_zstd_errname_fn)dlsym(h, "ZSTD_getErrorName");
 	sqd_zstd_compress_bound = (sqd_zstd_bound_fn)dlsym(h, "ZSTD_compressBound");
+	// The version string is diagnostic only: a library that predates it must
+	// still load, so it is not part of the entry point check below.
+	sqd_zstd_version = (sqd_zstd_version_fn)dlsym(h, "ZSTD_versionString");
 	if (sqd_zstd_new_cctx == NULL || sqd_zstd_free_cctx == NULL ||
 			sqd_zstd_compress_cctx == NULL || sqd_zstd_new_dctx == NULL ||
 			sqd_zstd_free_dctx == NULL || sqd_zstd_decompress_dctx == NULL ||
@@ -74,6 +79,15 @@ static const char *sqd_zstd_load(const char *path) {
 		return "library does not export the ZSTD entry points";
 	}
 	return NULL;
+}
+
+// sqd_zstd_version_str is the library's own version string, or NULL when it
+// does not export one.
+static const char *sqd_zstd_version_str(void) {
+	if (sqd_zstd_version == NULL) {
+		return NULL;
+	}
+	return sqd_zstd_version();
 }
 
 static void *sqd_zstd_cctx_new(void) { return sqd_zstd_new_cctx(); }
@@ -297,6 +311,23 @@ func (z *zstdCompressor) worker(j int) (*zstdWorker, error) {
 }
 
 func (z *zstdCompressor) ID() uint16 { return compressorZstd }
+
+// ToolVersion is the version of the very library the blocks were compressed
+// with, or "" when the library does not export one.
+func (z *zstdCompressor) ToolVersion() string {
+	if v := zstdVersion(); v != "" {
+		return "zstd: " + v
+	}
+	return ""
+}
+
+// zstdVersion is the loaded library's own version string.
+func zstdVersion() string {
+	if v := C.sqd_zstd_version_str(); v != nil {
+		return C.GoString(v)
+	}
+	return ""
+}
 
 func (z *zstdCompressor) MaxBlocksPerCall() int { return zstdMaxBlocksPerCall }
 

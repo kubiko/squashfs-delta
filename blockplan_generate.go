@@ -329,6 +329,13 @@ func generateBlockPlan(ctx context.Context, sourcePath, targetPath, deltaPath st
 			stats.InstrStored = int(e.entry.StoredLen)
 		}
 	}
+	// SEC_TOOLVER is advisory bookkeeping, so its probes never fail the
+	// generation; nothing to record means no section. It is added here, before
+	// SEC_PAY, because the reader requires SEC_PAY to be the last entry in the
+	// section table.
+	if tv := captureToolVersions(ctx, opts.Comp, opts.HdiffzPath, opts.HpatchzPath); tv != nil {
+		w.addSection(secToolVer, tv)
+	}
 	if payw.n > 0 {
 		w.addSectionFile(secPay, pay.File, int(payw.n), payw.crc)
 	}

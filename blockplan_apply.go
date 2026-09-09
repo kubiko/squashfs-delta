@@ -205,6 +205,14 @@ func applyBlockPlan(ctx context.Context, src *os.File, delta io.Reader, out io.W
 	if err != nil {
 		return nil, fmt.Errorf("source metadata: %w", err)
 	}
+	// The recorded tool versions are advisory: the canary and the byte checks
+	// are the gates, so drift is a warning, not an error. It goes ahead of the
+	// canary because the canary is the check compressor drift fails first, and
+	// a warning printed after that error would never be printed at all.
+	if tv := br.section(secToolVer); tv != nil {
+		checkToolVersions(ctx, os.Stderr, tv, opts.Comp, opts.HpatchzPath)
+	}
+
 	if canary := br.section(secCanary); canary != nil {
 		if err := checkCanary(ctx, canary, srcMeta, opts.Comp, st.blockSize); err != nil {
 			return nil, err
