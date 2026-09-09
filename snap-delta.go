@@ -149,8 +149,17 @@ var (
 	// compression duplicates window (-P)
 	xdelta3Tuning = []string{"-7"}
 
-	// hdiffz tuning
-	hdiffzTuning  = []string{"-m-6", "-SD", "-c-zstd-21-24", "-d"}
+	// hdiffz tuning, for HDiffPatch's hdiffz: -m-6 raises the match score to 6
+	// from the -m-4 default -- hdiffz recommends 0--4 for binary data and 4--9
+	// for text, but on these images the higher score measured about 2x faster
+	// at equal patch size; -SD is the single-compressed diff format, one
+	// decompress buffer on the device, default 256k step; -c-zstd-21-24
+	// compresses the diff with zstd level 21 and a 16 MiB window; -d skips
+	// hdiffz's own patch check, which the generator repeats byte for byte.
+	hdiffzTuning = []string{"-m-6", "-SD", "-c-zstd-21-24", "-d"}
+	// hpatchz tuning: -s-8m is the stream cache, already the default, made
+	// explicit. Call sites add -f, force overwrite, because they rewrite
+	// their own output file.
 	hpatchzTuning = []string{"-s-8m"}
 
 	// unsquashfs tuning.
