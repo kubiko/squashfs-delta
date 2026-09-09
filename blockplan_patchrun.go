@@ -48,10 +48,12 @@ type patchRunTuning struct {
 	WindowRatio float64
 	// MinSaving is the fewest bytes a run must save over the equivalent
 	// literals to be worth any device compression at all. It is about process
-	// overhead rather than the trade -- a run costs three forks (hdiffz here,
-	// xz -dc and xz on the device) -- and the measurements below say that
-	// overhead does not materialise, so it defaults to no floor and is kept as
-	// a dial for a caller who has a device that says otherwise.
+	// overhead rather than the trade -- a run costs the device one hpatchz
+	// spawn, and on an xz image one xz per source window it rebuilds plus one
+	// more to recompress the run, where lzo and zstd do both in process -- and
+	// the measurements below say that overhead does not materialise, so it
+	// defaults to no floor and is kept as a dial for a caller who has a device
+	// that says otherwise.
 	MinSaving int
 	// MinSavingRate is the trade itself: the delta bytes a run must save per
 	// byte of plaintext it makes the device compress. A relative
