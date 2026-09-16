@@ -1329,6 +1329,9 @@ func newCLI() *cli {
 					"Extra hdiffz options, merged into the built-in tuning;",
 					"one naming an option the tuning already sets replaces",
 					`it (e.g. "-c-zstd-19-24 -block-0")`,
+					// Read off the tuning itself, so the help cannot claim a
+					// default the generator stopped using.
+					"(built-in tuning: " + strings.Join(hdiffzTuning, " ") + ")",
 				}, bind: str(&c.genHdiffzArgs, "")},
 			},
 		}},
