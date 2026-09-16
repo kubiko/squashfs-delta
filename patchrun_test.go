@@ -24,6 +24,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -696,5 +697,64 @@ func TestPatchRunCrossesRawStretch(t *testing.T) {
 	if stats.PatchBytes > 256<<10 {
 		t.Errorf("patching a run across a raw stretch cost %d bytes, and the run only "+
 			"reconstructs %d bytes of plaintext", stats.PatchBytes, stats.PatchedUBytes)
+	}
+}
+
+// TestHdiffzArgsReplaceCollidingOption pins the merge that makes --hdiffz-args
+// usable at all: hdiffz refuses an option given twice, so an extra has to take
+// the built-in one's place.
+func TestHdiffzArgsReplaceCollidingOption(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra []string
+		want  []string
+	}{
+		{"no extras leaves the tuning alone", nil, hdiffzTuning},
+		{"a level replaces the built-in level",
+			[]string{"-c-zstd-19-24"},
+			[]string{"-m-6", "-SD", "-d", "-c-zstd-19-24"}},
+		{"an option the tuning does not set is added",
+			[]string{"-block-0"},
+			[]string{"-m-6", "-SD", "-c-zstd-21-24", "-d", "-block-0"}},
+		{"case distinguishes -c from -C",
+			[]string{"-C-xxh128"},
+			[]string{"-m-6", "-SD", "-c-zstd-21-24", "-d", "-C-xxh128"}},
+		{"several at once, in the order given",
+			[]string{"-m-0", "-c-zstd-19-24", "-block-0"},
+			[]string{"-SD", "-d", "-m-0", "-c-zstd-19-24", "-block-0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hdiffzArgs(tc.extra)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("hdiffzArgs(%q) = %q, want %q", tc.extra, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseHdiffzArgsRefusesNonOptions checks the command line refuses anything
+// that would land where hdiffz expects one of its three paths.
+func TestParseHdiffzArgsRefusesNonOptions(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"  -m-4   -SD-64k ", []string{"-m-4", "-SD-64k"}},
+		{"-m-4 old.img", nil},
+		{"-6", nil},
+		{"-", nil},
+	} {
+		got, err := parseHdiffzArgs(tc.in)
+		switch {
+		case tc.want == nil && tc.in != "":
+			if err == nil {
+				t.Errorf("parseHdiffzArgs(%q) = %q, want an error", tc.in, got)
+			}
+		case err != nil:
+			t.Errorf("parseHdiffzArgs(%q): %v", tc.in, err)
+		case !slices.Equal(got, tc.want):
+			t.Errorf("parseHdiffzArgs(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

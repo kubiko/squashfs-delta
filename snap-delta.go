@@ -1207,12 +1207,29 @@ func (c *command) misplacedOption(blocks bool) string {
 	return ""
 }
 
+// parseHdiffzArgs splits --hdiffz-args into hdiffz options. Every field has to
+// be an option, because hdiffz reads its old, new and diff paths positionally:
+// a bare word would take the place of one of them, and hdiffz would either
+// diff the wrong file or write the diff over it. Refusing here means a typo
+// costs nothing, rather than surfacing as a failed diff partway through a
+// generate.
+func parseHdiffzArgs(s string) ([]string, error) {
+	args := strings.Fields(s)
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") || hdiffzOption(arg) == "-" {
+			return nil, fmt.Errorf("--hdiffz-args takes hdiffz options, each a dash and an option name: %q is not one", arg)
+		}
+	}
+	return args, nil
+}
+
 // cli is the whole command line: the commands, and the variables their options
 // bind to.
 type cli struct {
 	commands []*command
 
 	genSource, genTarget, genDelta                  string
+	genHdiffzArgs                                   string
 	xdelta3Tool, hdiffzFormat                       bool
 	genMaxRun, genMinSaving                         int
 	genNoVerify, genNoPatchRuns, genNoPathMatch     bool
@@ -1308,6 +1325,11 @@ func newCLI() *cli {
 				{long: "run-log", help: []string{
 					"Log run details (plaintext, window, cost) to stderr",
 				}, bind: yes(&c.genRunLog)},
+				{long: "hdiffz-args", arg: "<args>", help: []string{
+					"Extra hdiffz options, merged into the built-in tuning;",
+					"one naming an option the tuning already sets replaces",
+					`it (e.g. "-c-zstd-19-24 -block-0")`,
+				}, bind: str(&c.genHdiffzArgs, "")},
 			},
 		}},
 	}, {
@@ -1503,6 +1525,11 @@ func main() {
 			log.Fatalf("%s tunes the %s format and is only read with --hdiffz", bad, snapDeltaFormatHdiffz)
 		}
 		if c.hdiffzFormat {
+			extra, perr := parseHdiffzArgs(c.genHdiffzArgs)
+			if perr != nil {
+				cmd.fs.Usage()
+				log.Fatal(perr)
+			}
 			err = cmdGenerateBlocks(context.Background(), c.genSource, c.genTarget, c.genDelta, genCmdOpts{
 				MaxRun:        c.genMaxRun,
 				Verify:        !c.genNoVerify,
@@ -1514,6 +1541,7 @@ func main() {
 
 				WindowBackFrac: c.genWindowBack,
 				RunLog:         c.genRunLog,
+				HdiffzArgs:     extra,
 			})
 			break
 		}

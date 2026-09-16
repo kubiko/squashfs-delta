@@ -62,6 +62,12 @@ These tune `--hdiffz` and are refused with any other format:
   delta and compares it byte for byte. That pass runs by default.
 * `--run-log`: log each run considered -- plaintext, window, cost -- to stderr,
   under a header explaining the columns.
+* `--hdiffz-args`: extra `hdiffz` options for every diff the generate runs, as
+  one quoted string, e.g. `--hdiffz-args "-c-zstd-19-24 -block-0"`. They are
+  merged into the built-in tuning, and one naming an option that tuning already
+  sets replaces it -- `hdiffz` refuses an option given twice, so appending
+  could not change the compression level or the match score. Everything has to
+  be an option: `hdiffz` takes its file paths positionally.
 
 ### apply
 The format is read from the delta, so no format option is given.

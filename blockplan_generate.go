@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -111,6 +112,11 @@ type blockPlanGenOpts struct {
 	// look them up.
 	HdiffzPath  string
 	HpatchzPath string
+	// HdiffzArgs are extra hdiffz options for a caller measuring a diff
+	// setting the built-in tuning does not use. Each must be an option: hdiffz
+	// takes its old, new and diff paths positionally, so a bare word would
+	// stand in for one of them.
+	HdiffzArgs []string
 	// MaxRunUSize caps the plaintext one patch run may reconstruct, which is
 	// what bounds the applier's peak memory. Zero picks a default.
 	MaxRunUSize int
@@ -313,7 +319,7 @@ func generateBlockPlan(ctx context.Context, sourcePath, targetPath, deltaPath st
 		// The metadata never survives verbatim between revisions: the inode
 		// table encodes every block's size and offset. It is small, so a
 		// patch plus one recompression pass is cheap.
-		patch, err := runHdiffz(ctx, srcMeta.Blob, tgtMeta.Blob, opts.HdiffzPath)
+		patch, err := runHdiffz(ctx, srcMeta.Blob, tgtMeta.Blob, opts.HdiffzPath, opts.HdiffzArgs)
 		if err != nil {
 			return nil, fmt.Errorf("diffing the metadata: %w", err)
 		}
@@ -540,9 +546,41 @@ func emitDataRegion(ctx context.Context, tgt *SquashfsImage, ext []Extent, idx *
 	return flushCopy()
 }
 
+// hdiffzOption is the option an argument names, without its value, because
+// hdiffz spells the value into the option itself: -c-zstd-21-24 and
+// -c-zstd-19-24 are one option set twice, not two options. Case is part of the
+// name -- -c compresses the diff, -C picks its checksum.
+func hdiffzOption(arg string) string {
+	name := strings.TrimPrefix(arg, "-")
+	end := 0
+	for end < len(name) && (name[end] >= 'a' && name[end] <= 'z' || name[end] >= 'A' && name[end] <= 'Z') {
+		end++
+	}
+	return "-" + name[:end]
+}
+
+// hdiffzArgs merges extra options into the built-in tuning. An extra naming an
+// option hdiffzTuning already sets replaces it rather than joining it, because
+// hdiffz refuses an option given twice -- appending -c-zstd-19-24 aborts the
+// diff with "options -c- ERROR!" instead of lowering the level, which would
+// make the two settings most worth measuring the two that cannot be passed.
+func hdiffzArgs(extra []string) []string {
+	replaced := make(map[string]bool, len(extra))
+	for _, arg := range extra {
+		replaced[hdiffzOption(arg)] = true
+	}
+	args := make([]string, 0, len(hdiffzTuning)+len(extra))
+	for _, arg := range hdiffzTuning {
+		if !replaced[hdiffzOption(arg)] {
+			args = append(args, arg)
+		}
+	}
+	return append(args, extra...)
+}
+
 // runHdiffz diffs old against updated, returning the patch. hdiffz works on
 // paths, so all three files live in memfds.
-func runHdiffz(ctx context.Context, old, updated []byte, hdiffzPath string) ([]byte, error) {
+func runHdiffz(ctx context.Context, old, updated []byte, hdiffzPath string, extra []string) ([]byte, error) {
 	if hdiffzPath == "" {
 		var err error
 		if hdiffzPath, err = toolPath("hdiffz"); err != nil {
@@ -565,7 +603,7 @@ func runHdiffz(ctx context.Context, old, updated []byte, hdiffzPath string) ([]b
 	}
 	defer diffFD.Close()
 
-	args := append(append([]string{}, hdiffzTuning...), "-f", oldFD.Path, newFD.Path, diffFD.Path)
+	args := append(hdiffzArgs(extra), "-f", oldFD.Path, newFD.Path, diffFD.Path)
 	if err := runWithContext(ctx, exec.CommandContext(ctx, hdiffzPath, args...)); err != nil {
 		return nil, fmt.Errorf("hdiffz: %w", err)
 	}

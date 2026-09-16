@@ -457,7 +457,7 @@ func buildPatchRun(ctx context.Context, tgt *SquashfsImage, run *candidateRun, p
 			run.ext[0].Offset, len(plain), uTotal)
 	}
 
-	patch, err := runHdiffz(ctx, old, plain, opts.HdiffzPath)
+	patch, err := runHdiffz(ctx, old, plain, opts.HdiffzPath, opts.HdiffzArgs)
 	if err != nil {
 		return nil, fmt.Errorf("diffing a run of %d blocks: %w", len(run.ext), err)
 	}

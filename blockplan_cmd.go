@@ -140,6 +140,9 @@ type genCmdOpts struct {
 	// RunLog asks for one line per patch run on stderr, which is how a bad
 	// run gets told apart from a run whose content really changed.
 	RunLog bool
+	// HdiffzArgs are extra hdiffz options, already split and checked to be
+	// options by the command line.
+	HdiffzArgs []string
 }
 
 // cmdGenerateBlocks generates a block-plan delta and reports its composition.
@@ -175,6 +178,7 @@ func cmdGenerateBlocks(ctx context.Context, sourceSnap, targetSnap, delta string
 		NoPathMatch: o.NoPathMatch,
 		Tuning:      tune,
 		RunLog:      runLog,
+		HdiffzArgs:  o.HdiffzArgs,
 	})
 	if err != nil {
 		return err
